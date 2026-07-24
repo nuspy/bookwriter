@@ -27,8 +27,20 @@ def test_mainwindow_builds(qapp, temp_workspace: Path) -> None:
     win = MainWindow()
     assert win.tabs.count() == 10
     titles = [win.tabs.tabText(i) for i in range(win.tabs.count())]
-    for expected in ("Ingestione", "Memoria", "Outline", "Stile", "Interazione", "Brief", "Rewrite", "Translate", "Authoring"):
-        assert expected in titles
+    # Titoli funzionali (orientati al compito dell'utente), non ai nomi interni del motore.
+    for expected in (
+        "Importa testi",
+        "Prepara contenuti",
+        "Componi il libro",
+        "Struttura (modifica)",
+        "Stile di scrittura",
+        "Completa i contenuti",
+        "Riepilogo progetto",
+        "Riscrivi in altro stile",
+        "Traduci",
+        "Scrivi da zero",
+    ):
+        assert any(expected in t for t in titles), expected
     win.close()
 
 

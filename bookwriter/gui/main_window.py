@@ -119,16 +119,25 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.addLayout(self._build_project_bar())
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._tab_ingest(), "Ingestione")
-        self.tabs.addTab(self._tab_memory(), "Memoria")
-        self.tabs.addTab(self._tab_organize(), "Organizza & Export")
-        self.tabs.addTab(self._tab_outline(), "Outline")
-        self.tabs.addTab(self._tab_style(), "Stile")
-        self.tabs.addTab(self._tab_interact(), "Interazione")
-        self.tabs.addTab(self._tab_brief(), "Brief")
-        self.tabs.addTab(self._tab_rewrite(), "Rewrite")
-        self.tabs.addTab(self._tab_translate(), "Translate")
-        self.tabs.addTab(self._tab_authoring(), "Authoring")
+        # Ogni scheda ha un titolo funzionale e un aggiornatore dei dati (per indice,
+        # così i titoli restano liberi di cambiare senza rompere la logica).
+        self._tab_refreshers: list[Callable[[], None] | None] = []
+        tab_specs = [
+            (self._tab_ingest(), "1 · Importa testi", None),
+            (self._tab_memory(), "2 · Prepara contenuti", self._refresh_mem_stats),
+            (self._tab_organize(), "3 · Componi il libro", self._refresh_compose_lists),
+            (self._tab_outline(), "Struttura (modifica)", self._refresh_outline_combo),
+            (self._tab_style(), "Stile di scrittura", self._refresh_styles),
+            (self._tab_interact(), "Completa i contenuti",
+             lambda: self._refresh_questions(self.pm.paths(self.pm.active_slug()))),
+            (self._tab_brief(), "Riepilogo progetto", self._do_brief),
+            (self._tab_rewrite(), "Riscrivi in altro stile", self._refresh_rewrite_lists),
+            (self._tab_translate(), "Traduci", self._refresh_translate_lists),
+            (self._tab_authoring(), "Scrivi da zero", self._refresh_author_lists),
+        ]
+        for widget, title, refresher in tab_specs:
+            self.tabs.addTab(widget, title)
+            self._tab_refreshers.append(refresher)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs)
         self.setCentralWidget(central)
@@ -140,29 +149,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Pronto")
         self._reload_projects()
 
-    def _on_tab_changed(self, _index: int) -> None:
+    def _on_tab_changed(self, index: int) -> None:
         """Aggiorna il pannello selezionato con i dati correnti."""
         if not self.pm.active_slug():
             return
-        title = self.tabs.tabText(self.tabs.currentIndex())
-        if title == "Memoria":
-            self._refresh_mem_stats()
-        elif title == "Organizza & Export":
-            self._refresh_compose_lists()
-        elif title == "Outline":
-            self._refresh_outline_combo()
-        elif title == "Stile":
-            self._refresh_styles()
-        elif title == "Interazione":
-            self._refresh_questions(self.pm.paths(self.pm.active_slug()))
-        elif title == "Brief":
-            self._do_brief()
-        elif title == "Rewrite":
-            self._refresh_rewrite_lists()
-        elif title == "Translate":
-            self._refresh_translate_lists()
-        elif title == "Authoring":
-            self._refresh_author_lists()
+        refresher = self._tab_refreshers[index] if 0 <= index < len(self._tab_refreshers) else None
+        if refresher:
+            refresher()
 
     # ------------------------------------------------------------------ #
     #  infrastruttura
@@ -195,6 +188,14 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(_error)
         worker.signals.progress.connect(_prog)
         self.pool.start(worker)
+
+    @staticmethod
+    def _hint(text: str) -> QLabel:
+        """Riga di aiuto in cima a un pannello: spiega a cosa serve, in parole semplici."""
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color: palette(mid); padding: 2px 0 6px 0;")
+        return lbl
 
     def _active(self) -> tuple[str, object] | None:
         slug = self.pm.active_slug()
@@ -278,6 +279,10 @@ class MainWindow(QMainWindow):
     def _tab_ingest(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._hint(
+            "Passo 1 — Aggiungi i testi di partenza: appunti, capitoli, interi documenti. "
+            "Verranno copiati nel progetto e spezzati in blocchi. Formati: txt, md, pdf, docx, epub."
+        ))
         btns = QHBoxLayout()
         add_files = QPushButton("Aggiungi file…")
         add_files.clicked.connect(self._add_files)
@@ -285,7 +290,7 @@ class MainWindow(QMainWindow):
         add_dir.clicked.connect(self._add_dir)
         btns.addWidget(add_files)
         btns.addWidget(add_dir)
-        self.recursive_cb = QCheckBox("Ricorsivo")
+        self.recursive_cb = QCheckBox("Includi le sottocartelle")
         self.recursive_cb.setChecked(True)
         btns.addWidget(self.recursive_cb)
         btns.addStretch(1)
@@ -295,9 +300,9 @@ class MainWindow(QMainWindow):
         self.paths_list.paths_dropped.connect(self._add_dropped)
         lay.addWidget(self.paths_list, 1)
         run = QHBoxLayout()
-        import_btn = QPushButton("Importa nella memoria")
+        import_btn = QPushButton("Importa i testi selezionati")
         import_btn.clicked.connect(self._do_ingest)
-        clear_btn = QPushButton("Svuota lista")
+        clear_btn = QPushButton("Svuota la lista")
         clear_btn.clicked.connect(lambda: (self._selected_paths.clear(), self.paths_list.clear()))
         run.addWidget(import_btn)
         run.addWidget(clear_btn)
@@ -339,7 +344,7 @@ class MainWindow(QMainWindow):
             )
             return report.summary()
 
-        self._run_bg(job, lambda s: (self.ingest_result.setText(s), self._refresh_project_info()), "Importazione…")
+        self._run_bg(job, lambda s: (self.ingest_result.setText(s), self._refresh_project_info()), "Importo i testi…")
 
     # ------------------------------------------------------------------ #
     #  tab: memoria
@@ -347,26 +352,34 @@ class MainWindow(QMainWindow):
     def _tab_memory(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._hint(
+            "Passo 2 — Prepara il materiale importato prima di comporre il libro. "
+            "Esegui i pulsanti in ordine: rendi i testi ricercabili, estrai le idee chiave, collegale tra loro. "
+            "In basso puoi cercare per significato (non per parola esatta)."
+        ))
         row = QHBoxLayout()
-        for label, handler in [
-            ("Embedda chunk", self._do_embed_chunks),
-            ("Atomizza", self._do_atomize),
-            ("Costruisci grafo", self._do_graph),
-            ("Esporta archivio (wiki)", self._do_export_wiki),
-            ("Aggiorna stats", lambda: self._refresh_mem_stats()),
+        for label, tip, handler in [
+            ("Rendi ricercabile", "Indicizza i testi per la ricerca per significato (embedding).", self._do_embed_chunks),
+            ("Estrai le idee", "Scompone i testi in singole idee con temi, entità e date.", self._do_atomize),
+            ("Collega le idee", "Costruisce la rete tematica che unisce idee affini.", self._do_graph),
+            ("Esporta archivio navigabile", "Crea un archivio HTML con pagine e grafo delle idee.", self._do_export_wiki),
+            ("Aggiorna conteggi", "Ricalcola documenti, blocchi, idee e collegamenti.", lambda: self._refresh_mem_stats()),
         ]:
             b = QPushButton(label)
+            b.setToolTip(tip)
             b.clicked.connect(handler)
             row.addWidget(b)
         lay.addLayout(row)
         self.mem_stats = QLabel("")
         lay.addWidget(self.mem_stats)
         search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Cerca:"))
         self.search_target = QComboBox()
-        self.search_target.addItems(["chunk", "nodi"])
+        self.search_target.addItem("nei testi", "chunk")
+        self.search_target.addItem("nelle idee", "node")
         search_row.addWidget(self.search_target)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Ricerca semantica…")
+        self.search_edit.setPlaceholderText("Descrivi cosa cerchi, con parole tue…")
         self.search_edit.returnPressed.connect(self._do_search)
         sbtn = QPushButton("Cerca")
         sbtn.clicked.connect(self._do_search)
@@ -397,7 +410,7 @@ class MainWindow(QMainWindow):
         self._run_bg(
             lambda p: embed_chunks(ppaths.db, ppaths.vectors, client, progress=p).summary(),
             lambda s: (self.mem_stats.setText(s), self._refresh_mem_stats()),
-            "Embedding chunk…",
+            "Rendo i testi ricercabili…",
             progressable=True,
         )
 
@@ -411,7 +424,7 @@ class MainWindow(QMainWindow):
         self._run_bg(
             lambda p: atomize_chunks(ppaths.db, client, model=model, progress=p).summary(),
             lambda s: (self.mem_stats.setText(s), self._refresh_mem_stats()),
-            "Atomizzazione…",
+            "Estraggo le idee…",
             progressable=True,
         )
 
@@ -426,7 +439,7 @@ class MainWindow(QMainWindow):
             embed_nodes(ppaths.db, ppaths.vectors, client, progress=p)
             return build_graph(ppaths.db, ppaths.vectors).summary()
 
-        self._run_bg(job, lambda s: (self.mem_stats.setText(s), self._refresh_mem_stats()), "Costruzione grafo…", progressable=True)
+        self._run_bg(job, lambda s: (self.mem_stats.setText(s), self._refresh_mem_stats()), "Collego le idee…", progressable=True)
 
     def _do_export_wiki(self) -> None:
         active = self._active()
@@ -445,7 +458,7 @@ class MainWindow(QMainWindow):
             return
         slug, ppaths = active
         client = self._client(slug)
-        on_nodes = self.search_target.currentText() == "nodi"
+        on_nodes = self.search_target.currentData() == "node"
 
         def job():
             if on_nodes:
@@ -470,54 +483,67 @@ class MainWindow(QMainWindow):
     def _tab_organize(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._hint(
+            "Passo 3 — Prima raggruppa le idee in capitoli, poi genera il libro. Due modi: "
+            "«Esporta» crea un'antologia dei testi originali riordinati; «Scrivi il libro in prosa» "
+            "fa riscrivere tutto all'assistente nello stile e nella lunghezza che scegli."
+        ))
+        lay.addWidget(QLabel("① Raggruppa le idee in capitoli"))
         row = QHBoxLayout()
-        row.addWidget(QLabel("Ordinamento:"))
+        row.addWidget(QLabel("Come ordinare:"))
         self.ordering_combo = QComboBox()
-        self.ordering_combo.addItems(["thematic", "chronological", "narrative", "custom"])
+        self.ordering_combo.addItem("per tema", "thematic")
+        self.ordering_combo.addItem("in ordine di tempo", "chronological")
+        self.ordering_combo.addItem("come un racconto (arco narrativo)", "narrative")
+        self.ordering_combo.addItem("con un mio criterio", "custom")
         row.addWidget(self.ordering_combo)
-        row.addWidget(QLabel("Capitoli (0=auto):"))
+        row.addWidget(QLabel("Numero di capitoli (0 = automatico):"))
         self.chapters_spin = QSpinBox()
         self.chapters_spin.setRange(0, 100)
         row.addWidget(self.chapters_spin)
+        row.addWidget(QLabel("Metodo:"))
         self.method_combo = QComboBox()
-        self.method_combo.addItems(["embedding", "community"])
+        self.method_combo.addItem("automatico (per similarità)", "embedding")
+        self.method_combo.addItem("per gruppi di idee affini", "community")
         row.addWidget(self.method_combo)
-        org_btn = QPushButton("Organizza")
+        org_btn = QPushButton("Raggruppa in capitoli")
         org_btn.clicked.connect(self._do_organize)
         row.addWidget(org_btn)
         row.addStretch(1)
         lay.addLayout(row)
         crit_row = QHBoxLayout()
-        crit_row.addWidget(QLabel("Criterio (solo custom):"))
+        crit_row.addWidget(QLabel("Il tuo criterio (solo se hai scelto «con un mio criterio»):"))
         self.criterion_edit = QLineEdit()
         self.criterion_edit.setPlaceholderText("es. per luogo, per personaggio, domanda→risposta…")
         crit_row.addWidget(self.criterion_edit, 1)
         lay.addLayout(crit_row)
+        lay.addWidget(QLabel("② Genera il libro"))
         exp = QHBoxLayout()
         exp.addWidget(QLabel("Formato:"))
         self.format_combo = QComboBox()
         self.format_combo.addItems(["docx", "md", "pdf"])
         exp.addWidget(self.format_combo)
-        exp_btn = QPushButton("Esporta")
+        exp_btn = QPushButton("Esporta antologia (testi originali)")
         exp_btn.clicked.connect(self._do_export)
         exp.addWidget(exp_btn)
-        preview_btn = QPushButton("Anteprima")
+        preview_btn = QPushButton("Anteprima struttura")
         preview_btn.clicked.connect(self._do_preview)
         exp.addWidget(preview_btn)
         exp.addStretch(1)
         lay.addLayout(exp)
         comp = QHBoxLayout()
-        comp.addWidget(QLabel("Stesura narrativa — stile:"))
+        comp.addWidget(QLabel("Oppure scrivi in prosa — stile:"))
         self.compose_style_combo = QComboBox()
         comp.addWidget(self.compose_style_combo, 1)
-        comp.addWidget(QLabel("target parole:"))
+        comp.addWidget(QLabel("lunghezza (parole):"))
         self.compose_target = QLineEdit()
         self.compose_target.setFixedWidth(90)
         comp.addWidget(self.compose_target)
-        comp_btn = QPushButton("Componi (prosa) + export DOCX")
+        comp_btn = QPushButton("Scrivi il libro in prosa (DOCX)")
         comp_btn.clicked.connect(self._do_compose)
         comp.addWidget(comp_btn)
-        coh_btn = QPushButton("Coerenza globale")
+        coh_btn = QPushButton("Uniforma nomi e termini")
+        coh_btn.setToolTip("Rende coerenti nomi propri e terminologia in tutto il libro già scritto.")
         coh_btn.clicked.connect(self._do_coherence)
         comp.addWidget(coh_btn)
         lay.addLayout(comp)
@@ -546,7 +572,7 @@ class MainWindow(QMainWindow):
         slug, ppaths = active
         oid = latest_outline_id(ppaths.db)
         if not oid:
-            QMessageBox.warning(self, "Nessun outline", "Esegui prima Organizza.")
+            QMessageBox.warning(self, "Nessuna struttura", "Prima raggruppa le idee in capitoli (Passo 3 ①).")
             return
         style_id = self.compose_style_combo.currentData()
         if style_id is not None:
@@ -577,7 +603,7 @@ class MainWindow(QMainWindow):
             pypandoc.convert_text(markdown, "docx", format="markdown", outputfile=str(out))
             return f"{rep.summary()}\nEsportato: {out}"
 
-        self._run_bg(job, lambda s: self.outline_preview.setPlainText(s), "Stesura narrativa…", progressable=True)
+        self._run_bg(job, lambda s: self.outline_preview.setPlainText(s), "Scrivo il libro in prosa…", progressable=True)
 
     def _do_coherence(self) -> None:
         active = self._active()
@@ -586,7 +612,7 @@ class MainWindow(QMainWindow):
         slug, ppaths = active
         oid = latest_outline_id(ppaths.db)
         if not oid:
-            QMessageBox.warning(self, "Nessun outline", "Esegui prima Organizza e Componi.")
+            QMessageBox.warning(self, "Ancora nessun libro", "Prima raggruppa in capitoli e scrivi il libro (Passo 3).")
             return
         client = self._client(slug)
         model = self.pm.config_for(slug).llm.models.quality
@@ -598,7 +624,7 @@ class MainWindow(QMainWindow):
                 lines.append(f"↺ ripetizione: {rep}")
             self.outline_preview.setPlainText("\n".join(lines))
 
-        self._run_bg(lambda: coherence_pass_compose(ppaths.db, oid, client, model=model), done, "Coerenza globale…")
+        self._run_bg(lambda: coherence_pass_compose(ppaths.db, oid, client, model=model), done, "Uniformo nomi e termini…")
 
     def _do_organize(self) -> None:
         active = self._active()
@@ -607,12 +633,12 @@ class MainWindow(QMainWindow):
         slug, ppaths = active
         client = self._client(slug)
         model = self.pm.config_for(slug).llm.models.reasoning
-        method = self.method_combo.currentText()
+        method = self.method_combo.currentData()
         chapters = self.chapters_spin.value() or None
-        ordering = self.ordering_combo.currentText()
+        ordering = self.ordering_combo.currentData()
         criterion = self.criterion_edit.text().strip()
         if ordering == "custom" and not criterion:
-            QMessageBox.warning(self, "Manca il criterio", "Per l'ordinamento custom serve un criterio.")
+            QMessageBox.warning(self, "Manca il criterio", "Hai scelto «con un mio criterio»: scrivi qual è nel campo apposito.")
             return
 
         def job() -> str:
@@ -626,7 +652,7 @@ class MainWindow(QMainWindow):
                 rep = organize_custom(ppaths.db, client, criterion, model=model)
             return f"{rep.summary()} (ordinamento: {ordering})"
 
-        self._run_bg(job, lambda s: self.statusBar().showMessage(s), "Organizzazione…")
+        self._run_bg(job, lambda s: self.statusBar().showMessage(s), "Raggruppo in capitoli…")
 
     def _do_export(self) -> None:
         active = self._active()
@@ -636,7 +662,7 @@ class MainWindow(QMainWindow):
         fmt = self.format_combo.currentText()
         oid = latest_outline_id(ppaths.db)
         if not oid:
-            QMessageBox.warning(self, "Nessun outline", "Esegui prima Organizza.")
+            QMessageBox.warning(self, "Nessuna struttura", "Prima raggruppa le idee in capitoli (Passo 3 ①).")
             return
         out = ppaths.exports / f"{slug}.{fmt}"
         self._run_bg(
@@ -652,7 +678,7 @@ class MainWindow(QMainWindow):
         _slug, ppaths = active
         oid = latest_outline_id(ppaths.db)
         if not oid:
-            QMessageBox.warning(self, "Nessun outline", "Esegui prima Organizza.")
+            QMessageBox.warning(self, "Nessuna struttura", "Prima raggruppa le idee in capitoli (Passo 3 ①).")
             return
         self.outline_preview.setPlainText(outline_to_markdown(ppaths.db, oid))
 
@@ -662,8 +688,12 @@ class MainWindow(QMainWindow):
     def _tab_outline(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._hint(
+            "Sistema a mano l'indice del libro: trascina per riordinare i capitoli e spostare le idee, "
+            "doppio clic per rinominare un capitolo. Al termine premi «Salva la struttura»."
+        ))
         top = QHBoxLayout()
-        top.addWidget(QLabel("Outline:"))
+        top.addWidget(QLabel("Indice da modificare:"))
         self.outline_combo = QComboBox()
         self.outline_combo.currentIndexChanged.connect(self._load_outline_tree)
         top.addWidget(self.outline_combo, 1)
@@ -671,19 +701,18 @@ class MainWindow(QMainWindow):
         reload_btn.clicked.connect(self._load_outline_tree)
         top.addWidget(reload_btn)
         lay.addLayout(top)
-        lay.addWidget(QLabel("Trascina per riordinare capitoli e spostare nodi. Doppio clic per rinominare un capitolo."))
         self.outline_tree = QTreeWidget()
-        self.outline_tree.setHeaderLabels(["Capitoli e nodi"])
+        self.outline_tree.setHeaderLabels(["Capitoli e idee"])
         self.outline_tree.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.outline_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         lay.addWidget(self.outline_tree, 1)
         btns = QHBoxLayout()
         for label, handler in [
             ("Aggiungi capitolo", self._outline_add_chapter),
-            ("Rinomina", self._outline_rename),
+            ("Rinomina capitolo", self._outline_rename),
             ("Elimina selezionato", self._outline_delete),
-            ("Suddividi in sezioni", self._do_subdivide),
-            ("Salva struttura", self._outline_save),
+            ("Dividi i capitoli in sezioni", self._do_subdivide),
+            ("Salva la struttura", self._outline_save),
         ]:
             b = QPushButton(label)
             b.clicked.connect(handler)
@@ -758,7 +787,7 @@ class MainWindow(QMainWindow):
         self._run_bg(
             lambda: subdivide_sections(ppaths.db, ppaths.vectors, oid, client=client, model=model),
             lambda r: QMessageBox.information(self, "Sezioni", f"Create {r['sections']} sezioni (visibili in export/stesura)."),
-            "Suddivisione in sezioni…",
+            "Divido i capitoli in sezioni…",
         )
 
     def _outline_save(self) -> None:
@@ -797,26 +826,31 @@ class MainWindow(QMainWindow):
     def _tab_style(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._hint(
+            "Crea uno «stile di scrittura» e provalo su un testo. Uno stile può essere appreso da un "
+            "esempio, descritto a parole, o combinato da più autori. Gli stili qui creati si possono "
+            "usare nei passi Componi, Riscrivi e Traduci."
+        ))
         row = QHBoxLayout()
         for label, handler in [
-            ("Estrai da file…", self._do_style_extract),
-            ("Definisci (astratto)…", self._do_style_abstract),
-            ("Da autori…", self._do_style_authors),
-            ("Importa globale…", self._do_style_import_global),
+            ("Impara da un testo…", self._do_style_extract),
+            ("Descrivi a parole…", self._do_style_abstract),
+            ("Combina autori…", self._do_style_authors),
+            ("Importa dalla libreria…", self._do_style_import_global),
         ]:
             b = QPushButton(label)
             b.clicked.connect(handler)
             row.addWidget(b)
         row.addStretch(1)
         lay.addLayout(row)
-        lay.addWidget(QLabel("Profili di stile (seleziona per applicare):"))
+        lay.addWidget(QLabel("I tuoi stili (selezionane uno per provarlo):"))
         self.styles_list = QListWidget()
         lay.addWidget(self.styles_list, 1)
-        lay.addWidget(QLabel("Testo da riscrivere nello stile selezionato:"))
+        lay.addWidget(QLabel("Testo di prova da riscrivere nello stile scelto:"))
         self.style_input = QTextEdit()
-        self.style_input.setPlaceholderText("Incolla qui il testo…")
+        self.style_input.setPlaceholderText("Incolla qui un testo…")
         lay.addWidget(self.style_input, 1)
-        apply_btn = QPushButton("Applica stile")
+        apply_btn = QPushButton("Riscrivi il testo nello stile scelto")
         apply_btn.clicked.connect(self._do_style_apply)
         lay.addWidget(apply_btn)
         self.style_output = QTextEdit()
@@ -875,7 +909,7 @@ class MainWindow(QMainWindow):
             project_schema.save_style(ppaths.db, prof.name, prof.origin, prof.model_dump())
             return prof.name
 
-        self._run_bg(job, lambda _n: self._refresh_styles(), "Estrazione stile…")
+        self._run_bg(job, lambda _n: self._refresh_styles(), "Imparo lo stile…")
 
     def _do_style_abstract(self) -> None:
         active = self._active()
@@ -895,7 +929,7 @@ class MainWindow(QMainWindow):
             project_schema.save_style(ppaths.db, prof.name, prof.origin, prof.model_dump())
             return prof.name
 
-        self._run_bg(job, lambda _n: self._refresh_styles(), "Definizione stile…")
+        self._run_bg(job, lambda _n: self._refresh_styles(), "Definisco lo stile…")
 
     def _do_style_authors(self) -> None:
         active = self._active()
@@ -927,7 +961,7 @@ class MainWindow(QMainWindow):
             project_schema.save_style(ppaths.db, prof.name, prof.origin, prof.model_dump())
             return prof.name
 
-        self._run_bg(job, lambda _n: self._refresh_styles(), "Fusione autori…")
+        self._run_bg(job, lambda _n: self._refresh_styles(), "Combino gli autori…")
 
     def _do_style_apply(self) -> None:
         active = self._active()
@@ -948,7 +982,7 @@ class MainWindow(QMainWindow):
         self._run_bg(
             lambda: apply_style(text, profile, client, model=model),
             lambda out: self.style_output.setPlainText(out),
-            "Applicazione stile…",
+            "Riscrivo nello stile…",
         )
 
     # ------------------------------------------------------------------ #
@@ -957,8 +991,12 @@ class MainWindow(QMainWindow):
     def _tab_interact(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._hint(
+            "L'assistente analizza cosa manca al libro e propone domande. Ogni tua risposta diventa "
+            "un nuovo contenuto, pronto per essere organizzato e scritto."
+        ))
         top = QHBoxLayout()
-        ask_btn = QPushButton("Proponi domande")
+        ask_btn = QPushButton("Trova cosa manca (proponi domande)")
         ask_btn.clicked.connect(self._do_ask)
         top.addWidget(ask_btn)
         top.addStretch(1)
@@ -968,13 +1006,13 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.questions_list, 1)
         ans = QHBoxLayout()
         self.answer_edit = QLineEdit()
-        self.answer_edit.setPlaceholderText("La tua risposta / contenuto…")
-        integ = QPushButton("Integra come nodo")
+        self.answer_edit.setPlaceholderText("Scrivi qui la tua risposta…")
+        integ = QPushButton("Aggiungi la risposta al libro")
         integ.clicked.connect(self._do_answer)
         ans.addWidget(self.answer_edit, 1)
         ans.addWidget(integ)
         lay.addLayout(ans)
-        lay.addWidget(QLabel("Intenti / decisioni persistiti:"))
+        lay.addWidget(QLabel("Decisioni e scelte salvate:"))
         self.intents_list = QListWidget()
         lay.addWidget(self.intents_list, 1)
         return w
@@ -997,7 +1035,7 @@ class MainWindow(QMainWindow):
         self._run_bg(
             lambda: propose_questions(ppaths.db, client, model=model, n=3),
             lambda _r: self._refresh_questions(ppaths),
-            "Generazione domande…",
+            "Cerco cosa manca…",
         )
 
     def _do_answer(self) -> None:
@@ -1015,7 +1053,7 @@ class MainWindow(QMainWindow):
         self._run_bg(
             lambda: integrate_answer(ppaths.db, ppaths.vectors, client, qid, text),
             lambda nid: (self.answer_edit.clear(), self._refresh_questions(ppaths), self._refresh_project_info()),
-            "Integrazione risposta…",
+            "Aggiungo la risposta al libro…",
         )
 
     # ------------------------------------------------------------------ #
@@ -1024,7 +1062,11 @@ class MainWindow(QMainWindow):
     def _tab_brief(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
-        btn = QPushButton("Aggiorna brief")
+        lay.addWidget(self._hint(
+            "Riepilogo dello stato del progetto: tema, decisioni prese, contenuti e domande aperte. "
+            "Utile per riprendere il lavoro in una nuova sessione."
+        ))
+        btn = QPushButton("Aggiorna il riepilogo")
         btn.clicked.connect(self._do_brief)
         lay.addWidget(btn)
         self.brief_text = QTextEdit()
@@ -1045,23 +1087,28 @@ class MainWindow(QMainWindow):
     def _tab_rewrite(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._hint(
+            "Prendi un intero documento importato e riscrivilo in un nuovo stile, mantenendo la "
+            "coerenza. Prova prima l'anteprima del primo capitolo, poi riscrivi tutto."
+        ))
         row = QHBoxLayout()
         row.addWidget(QLabel("Stile:"))
         self.rw_style_combo = QComboBox()
         row.addWidget(self.rw_style_combo, 1)
-        row.addWidget(QLabel("Documento:"))
+        row.addWidget(QLabel("Documento da riscrivere:"))
         self.rw_doc_combo = QComboBox()
         row.addWidget(self.rw_doc_combo, 1)
-        row.addWidget(QLabel("Ratio:"))
+        row.addWidget(QLabel("Lunghezza (opz.):"))
         self.rw_ratio = QLineEdit()
-        self.rw_ratio.setPlaceholderText("opz. es. 0.7")
-        self.rw_ratio.setFixedWidth(80)
+        self.rw_ratio.setPlaceholderText("es. 0.7 = più corto")
+        self.rw_ratio.setToolTip("Rapporto sulla lunghezza originale: 1 = uguale, 0.7 = ~30% più corto, 1.3 = più lungo.")
+        self.rw_ratio.setFixedWidth(120)
         row.addWidget(self.rw_ratio)
         lay.addLayout(row)
         btns = QHBoxLayout()
-        prev_btn = QPushButton("Preview 1° capitolo")
+        prev_btn = QPushButton("Anteprima (primo capitolo)")
         prev_btn.clicked.connect(self._do_rewrite_preview)
-        full_btn = QPushButton("Riscrivi tutto + export DOCX")
+        full_btn = QPushButton("Riscrivi tutto il libro (DOCX)")
         full_btn.clicked.connect(self._do_rewrite_full)
         btns.addWidget(prev_btn)
         btns.addWidget(full_btn)
@@ -1124,7 +1171,7 @@ class MainWindow(QMainWindow):
                 blocks.append(f"— brano {i} ({p['chapter'] or ''}) —\nORIGINALE:\n{p['original']}\n\nRISCRITTO:\n{p['rewritten']}\n")
             self.rw_output.setPlainText("\n".join(blocks))
 
-        self._run_bg(job, done, "Preview riscrittura…")
+        self._run_bg(job, done, "Anteprima della riscrittura…")
 
     def _do_rewrite_full(self) -> None:
         setup = self._rewrite_setup()
@@ -1150,22 +1197,26 @@ class MainWindow(QMainWindow):
     def _tab_translate(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._hint(
+            "Traduci un intero documento in un'altra lingua mantenendo lo stile e i nomi coerenti. "
+            "Prova prima l'anteprima del primo capitolo."
+        ))
         row = QHBoxLayout()
-        row.addWidget(QLabel("Lingua:"))
+        row.addWidget(QLabel("Traduci in:"))
         self.tr_lang = QLineEdit()
         self.tr_lang.setPlaceholderText("es. inglese")
         row.addWidget(self.tr_lang)
         row.addWidget(QLabel("Stile:"))
         self.tr_style_combo = QComboBox()
         row.addWidget(self.tr_style_combo, 1)
-        row.addWidget(QLabel("Documento:"))
+        row.addWidget(QLabel("Documento da tradurre:"))
         self.tr_doc_combo = QComboBox()
         row.addWidget(self.tr_doc_combo, 1)
         lay.addLayout(row)
         btns = QHBoxLayout()
-        prev_btn = QPushButton("Preview 1° capitolo")
+        prev_btn = QPushButton("Anteprima (primo capitolo)")
         prev_btn.clicked.connect(lambda: self._do_translate(preview=True))
-        full_btn = QPushButton("Traduci tutto + export DOCX")
+        full_btn = QPushButton("Traduci tutto il libro (DOCX)")
         full_btn.clicked.connect(lambda: self._do_translate(preview=False))
         btns.addWidget(prev_btn)
         btns.addWidget(full_btn)
@@ -1240,30 +1291,34 @@ class MainWindow(QMainWindow):
     def _tab_authoring(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("1) Brief dell'opera"))
+        lay.addWidget(self._hint(
+            "Parti da (quasi) niente e lascia scrivere il libro all'assistente. Segui i tre passi: "
+            "descrivi l'opera, fai generare le idee, genera la bozza completa."
+        ))
+        lay.addWidget(QLabel("1) Descrivi l'opera"))
         brief = QHBoxLayout()
         self.au_theme = QLineEdit()
-        self.au_theme.setPlaceholderText("Tema")
+        self.au_theme.setPlaceholderText("Tema (di cosa parla)")
         self.au_audience = QLineEdit()
-        self.au_audience.setPlaceholderText("Pubblico")
+        self.au_audience.setPlaceholderText("Per chi (pubblico)")
         self.au_goal = QLineEdit()
-        self.au_goal.setPlaceholderText("Obiettivo")
+        self.au_goal.setPlaceholderText("Obiettivo (che effetto vuoi)")
         self.au_target = QLineEdit()
-        self.au_target.setPlaceholderText("Target parole")
-        self.au_target.setFixedWidth(100)
+        self.au_target.setPlaceholderText("Lunghezza (parole)")
+        self.au_target.setFixedWidth(130)
         for wdg in (self.au_theme, self.au_audience, self.au_goal, self.au_target):
             brief.addWidget(wdg)
-        start_btn = QPushButton("Avvia brief")
+        start_btn = QPushButton("Salva la descrizione")
         start_btn.clicked.connect(self._do_author_start)
         brief.addWidget(start_btn)
         lay.addLayout(brief)
 
-        lay.addWidget(QLabel("2) Genera idee (l'LLM crea contenuti dal nulla)"))
+        lay.addWidget(QLabel("2) Fai generare le idee (le crea l'assistente)"))
         exp = QHBoxLayout()
         self.au_topic = QLineEdit()
         self.au_topic.setPlaceholderText("Sotto-tema da sviluppare")
         exp.addWidget(self.au_topic, 1)
-        exp.addWidget(QLabel("n:"))
+        exp.addWidget(QLabel("quante:"))
         self.au_n = QSpinBox()
         self.au_n.setRange(1, 30)
         self.au_n.setValue(6)
@@ -1273,12 +1328,12 @@ class MainWindow(QMainWindow):
         exp.addWidget(exp_btn)
         lay.addLayout(exp)
 
-        lay.addWidget(QLabel("3) Genera la bozza (grafo → organizza → stesura → DOCX)"))
+        lay.addWidget(QLabel("3) Genera la bozza completa del libro (DOCX)"))
         draft = QHBoxLayout()
         draft.addWidget(QLabel("Stile:"))
         self.au_style_combo = QComboBox()
         draft.addWidget(self.au_style_combo, 1)
-        draft_btn = QPushButton("Genera bozza completa")
+        draft_btn = QPushButton("Genera la bozza completa")
         draft_btn.clicked.connect(self._do_author_draft)
         draft.addWidget(draft_btn)
         lay.addLayout(draft)
@@ -1338,7 +1393,7 @@ class MainWindow(QMainWindow):
         self._run_bg(
             lambda: expand_topic(ppaths.db, ppaths.vectors, client, topic=topic, n=n, audience=aud, goal=goal, model=model),
             lambda c: (self.au_output.setPlainText(f"Generate {c} idee sul tema «{topic}»."), self._refresh_project_info()),
-            "Generazione idee…",
+            "Genero le idee…",
         )
 
     def _do_author_draft(self) -> None:
@@ -1369,7 +1424,7 @@ class MainWindow(QMainWindow):
             pypandoc.convert_text(markdown, "docx", format="markdown", outputfile=str(out))
             return f"{rep.summary()}\nEsportato: {out}"
 
-        self._run_bg(job, lambda s: self.au_output.setPlainText(s), "Generazione bozza…")
+        self._run_bg(job, lambda s: self.au_output.setPlainText(s), "Genero la bozza del libro…")
 
     # ------------------------------------------------------------------ #
     def _placeholder(self, text: str) -> QWidget:
