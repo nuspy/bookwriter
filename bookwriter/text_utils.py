@@ -1,0 +1,70 @@
+"""Utility di testo deterministiche: normalizzazione, conteggio token, split in frasi.
+
+Il conteggio token è un'**euristica** (nessuna dipendenza dal tokenizer del modello): serve solo a
+rispettare il budget di chunking sotto il cap embedding (2048). È deterministica e stabile → stesso
+testo, stesso conteggio.
+"""
+
+from __future__ import annotations
+
+import re
+
+# ~4 caratteri per token: euristica comune, buona per lingue latine e per stare sotto il cap.
+_CHARS_PER_TOKEN = 4
+
+# Fine frase: punteggiatura terminale + spazio + inizio di nuova frase (maiuscola/apice/cifra).
+_SENTENCE_BOUNDARY = re.compile(
+    r'(?<=[.!?…])["”»\')\]]*\s+(?=[A-ZÀ-ÖØ-Þ0-9"“«¿¡\'(\[])'
+)
+
+# Riconosce righe-titolo (heading) tipiche.
+_HEADING_MD = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+_HEADING_NUMBERED = re.compile(
+    r"^\s*(cap(?:itolo|\.)?|parte|sezione|chapter|part|section)\s+[\dIVXLCM]+.*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_text(text: str) -> str:
+    """Uniforma i fine-riga, elimina spazi finali e comprime le righe vuote multiple."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def count_tokens(text: str) -> int:
+    """Stima deterministica del numero di token (~caratteri/4, minimo il numero di parole)."""
+    if not text:
+        return 0
+    return max(len(text.split()), round(len(text) / _CHARS_PER_TOKEN))
+
+
+def split_sentences(text: str) -> list[str]:
+    """Divide un testo in frasi. Deterministico; robusto per italiano/inglese."""
+    text = text.strip()
+    if not text:
+        return []
+    parts = _SENTENCE_BOUNDARY.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def looks_like_heading(line: str) -> tuple[bool, str | None]:
+    """True se la riga sembra un titolo; ritorna anche il testo del titolo depurato."""
+    stripped = line.strip()
+    if not stripped:
+        return False, None
+    md = _HEADING_MD.match(line)
+    if md:
+        return True, md.group(2).strip()
+    if _HEADING_NUMBERED.match(stripped):
+        return True, stripped
+    # Riga breve, senza punteggiatura terminale, in maiuscolo → probabile titolo.
+    if (
+        len(stripped) <= 80
+        and not stripped.endswith((".", ",", ";", ":"))
+        and stripped == stripped.upper()
+        and any(c.isalpha() for c in stripped)
+    ):
+        return True, stripped
+    return False, None

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# Test / tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Workspace di prova / dati locali
+.bookwriter/
+*.lance/
+*.db-wal
+*.db-shm
+
+# OS
+Thumbs.db
+.DS_Store
