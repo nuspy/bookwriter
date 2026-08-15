@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html as _html
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -271,3 +272,45 @@ def export_wiki(db_path: Path, out_dir: Path) -> dict[str, Path]:
     html_path = out_dir / "wiki.html"
     html_path.write_text(html_doc, encoding="utf-8")
     return {"html": html_path, "json": json_path}
+
+
+# --------------------------------------------------------------------------- #
+#  nomi dei file esportati
+# --------------------------------------------------------------------------- #
+_LANG_TAIL = re.compile(r"[ _-]([A-Za-z]{2,3})$")
+
+
+def _slug_part(text: str) -> str:
+    """Pezzo di nome file leggibile: niente spazi né caratteri vietati, accenti conservati."""
+    cleaned = re.sub(r"[\/:*?\"<>|]+", "", (text or "").strip())
+    return re.sub(r"\s+", "-", cleaned).strip("-_")
+
+
+def export_filename(
+    base: str,
+    *,
+    style: str = "",
+    language: str = "",
+    words: int | None = None,
+    qualifier: str = "",
+    ext: str = "docx",
+) -> str:
+    """Nome che descrive il contenuto: ``base_stile_LINGUA_lunghezza.ext``.
+
+    Ogni variante prodotta (stile diverso, lingua diversa, lunghezza diversa) ottiene così un
+    nome diverso e non sovrascrive le altre. Se ``base`` finisce già con una sigla di lingua
+    (``appunti_prosa_IT``) quella viene sostituita, non accodata.
+    """
+    stem = _slug_part(base) or "libro"
+    if language and _LANG_TAIL.search(stem):
+        stem = _LANG_TAIL.sub("", stem)
+    parts = [stem]
+    for extra in (qualifier, style):
+        piece = _slug_part(extra)
+        if piece:
+            parts.append(piece)
+    if language:
+        parts.append(language.upper())
+    if words:
+        parts.append(f"{round(words / 1000)}k" if words >= 1000 else str(words))
+    return "_".join(parts) + f".{ext.lstrip('.')}"

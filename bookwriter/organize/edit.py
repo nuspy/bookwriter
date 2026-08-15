@@ -77,3 +77,19 @@ def rebuild_outline(db_path: Path, outline_id: int, chapters: list[dict]) -> Non
             if items:
                 ses.add_all(items)
                 ses.commit()
+
+
+def rename_outline(db_path: Path, outline_id: int, name: str) -> str:
+    """Rinomina la struttura: è il titolo che finisce in testa al libro esportato."""
+    clean = (name or "").strip()
+    if not clean:
+        raise ValueError("Il titolo non può essere vuoto.")
+    engine = make_engine(db_path)
+    with Session(engine) as ses:
+        outline = ses.get(Outline, outline_id)
+        if outline is None:
+            raise ValueError(f"Struttura #{outline_id} inesistente.")
+        outline.name = clean
+        ses.add(outline)
+        ses.commit()
+    return clean

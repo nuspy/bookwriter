@@ -32,11 +32,33 @@ targets** with budgeting, a **global coherence** pass (names, timeline, repetiti
 
 - **Python 3.10+**
 - **[LM Studio](https://lmstudio.ai/)** running at `http://localhost:1234` with two models loaded:
-  - a **chat / reasoning** model (default: `gemma-4-12b-obliterated`)
+  - a **chat / reasoning** model (any instruct model; the default `qwen3-8b-instruct`
+    is only a starting value, changeable in the Settings tab)
   - an **embedding** model (default: `text-embedding-nomic-embed-text-v1.5`)
 - No system libraries needed: DOCX via bundled Pandoc (`pypandoc-binary`), PDF via `reportlab`.
 
 ## Installation
+
+### From the distributed .zip (Windows, recommended)
+
+Unpack the archive, open PowerShell in the extracted folder and run:
+
+```powershell
+.\install.ps1      # finds Python 3.10+, creates .venv, installs everything, checks LM Studio
+.\run.ps1          # opens the desktop application
+```
+
+`install.ps1` downloads about 1.5 GB of dependencies the first time (PySide6 and LanceDB are the
+bulk of it). You also need a model service running: **LM Studio** on `localhost:1234`, or a cloud
+provider key set in the Settings tab.
+
+Your projects and books are stored in `~/.bookwriter/`, outside the program folder: updating to a
+newer version never touches them.
+
+The full **installation and user manual** is in `docs/bookwriter-manual.pdf` (source:
+`docs/MANUAL.md`).
+
+### From source, manually
 
 ```bash
 python -m venv .venv
@@ -148,10 +170,12 @@ bookwriter author draft --format md                      # graph â†’ organize â†
 bookwriter gui
 ```
 
-Ten panels over the same engine: Projects (with live word counter), Ingestion (drag-and-drop),
-Memory + semantic search (chunks or nodes), Organize & Export (+ narrative composition), Outline
-(drag-and-drop editing, split into sections), Style, Rewrite, Translate, Interaction (questions /
-intents), Brief, Authoring. Long operations run in the background with a dedicated progress bar.
+Thirteen panels over the same engine: import, prepare content (split into sections, index, connect),
+compose the book, structure editing, writing style, complete the content, project summary, rewrite,
+translate, write from scratch, update an existing draft, model usage and costs, settings. Long
+operations run in the background with a progress bar and a live count.
+
+See `docs/bookwriter-manual.pdf` for the full guide.
 
 ---
 

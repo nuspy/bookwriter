@@ -31,6 +31,7 @@ def subdivide_sections(
     model: str | None = None,
     max_per_chapter: int | None = 4,
     min_nodes: int = 3,
+    progress=None,
 ) -> dict:
     engine = make_engine(db_path)
     vec_map = dict(LanceStore(vectors_path).all_vectors("node"))
@@ -51,7 +52,9 @@ def subdivide_sections(
         ses.commit()
 
     created = 0
-    for ch_id in chapter_ids:
+    for done, ch_id in enumerate(chapter_ids, start=1):
+        if progress:
+            progress(done, len(chapter_ids))
         with Session(engine) as ses:
             items = ses.exec(
                 select(OutlineItem.node_id, OutlineItem.position).where(OutlineItem.chapter_id == ch_id).order_by(OutlineItem.position)

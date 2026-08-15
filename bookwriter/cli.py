@@ -43,7 +43,7 @@ from bookwriter.organize import (
     subdivide_sections,
 )
 from bookwriter.projects import ProjectError, ProjectManager, ProjectPaths
-from bookwriter.rewrite import assemble_markdown, preview_pairs, rewrite_document
+from bookwriter.rewrite import preview_pairs, rewrite_document, write_result
 from bookwriter.style import (
     StyleProfile,
     abstract_style,
@@ -145,7 +145,6 @@ def _probe(client: LMStudioClient, chat_model: str, embed_model: str) -> None:
         reply = client.chat(
             [{"role": "user", "content": "Rispondi con una sola parola: pronto"}],
             model=chat_model,
-            max_tokens=10,
         )
         console.print(f"[green]✓[/green] chat: {reply.strip()[:60]!r}")
     except LLMError as exc:
@@ -853,8 +852,10 @@ def _run_book_transform(
             console.print(f"[bold]NUOVO:[/bold] {' '.join(pair['rewritten'].split())[:300]}")
         console.print("\n  se il risultato va bene, esegui senza --preview per l'intero libro.")
     else:
-        out = write_output(assemble_markdown(ppaths.db, report.run_id), ppaths.exports / f"{out_stem}.{fmt}", fmt)
+        out, nota = write_result(ppaths.db, report.run_id, ppaths.exports / f"{out_stem}.{fmt}", fmt)
         console.print(f"[green]✓[/green] esportato: {out}")
+        if nota:
+            console.print(f"  [yellow]{nota}[/yellow]")
 
 
 @app.command()

@@ -63,6 +63,9 @@ class ProjectManager:
         self.projects_dir = self.workspace / "projects"
         self.registry_path = self.workspace / "registry.db"
         self._engine = None
+        # Progetti già aperti in questa esecuzione: la pulizia dei documenti di lavoro va fatta
+        # una volta sola, non ogni volta che si passa da un progetto all'altro e si torna.
+        self._aperti: set[str] = set()
 
     # ---- setup ---------------------------------------------------------
     def ensure(self) -> None:
@@ -155,9 +158,30 @@ class ProjectManager:
     def paths(self, slug: str) -> ProjectPaths:
         return ProjectPaths(self.projects_dir / slug)
 
+    def open_project(self, slug: str) -> int:
+        """Prepara il progetto all'uso e ritorna quanti documenti di lavoro ha tolto.
+
+        Un libro aperto per tradurlo o riscriverlo vive quanto la sessione: alla riapertura del
+        programma l'elenco dei testi del progetto torna a contenere solo le fonti che ci sono
+        state messe apposta. La pulizia avviene qui, alla prima apertura del progetto.
+        """
+        if slug in self._aperti:
+            return 0
+        self._aperti.add(slug)
+        return project_schema.purge_transient_documents(self.paths(slug).db)
+
     def config_for(self, slug: str) -> AppConfig:
         """Config globale fusa con l'override di progetto."""
         return load_global_config().merged_with(AppConfig.load(self.paths(slug).config))
+
+    def save_config_for(self, slug: str, cfg: AppConfig) -> None:
+        """Scrive la config del progetto (override che vince su quella globale)."""
+        cfg.save(self.paths(slug).config)
+
+    def save_global_config(self, cfg: AppConfig) -> None:
+        """Scrive i default globali: valgono per i progetti senza override e per i nuovi."""
+        self.ensure()
+        cfg.save(global_config_path())
 
     def info(self, slug: str) -> dict:
         project = self.get(slug)

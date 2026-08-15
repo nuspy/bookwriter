@@ -28,6 +28,19 @@ class LanceStore:
         names = getattr(tables, "tables", tables)
         return self._table_name(kind) in names
 
+    def dimension(self, kind: str) -> int | None:
+        """Dimensione dei vettori già archiviati; ``None`` se la tabella non esiste o è vuota."""
+        if not self._has(kind):
+            return None
+        table = self._db.open_table(self._table_name(kind))
+        row = table.to_arrow().slice(0, 1).column("vector").to_pylist()
+        return len(row[0]) if row and row[0] is not None else None
+
+    def drop(self, kind: str) -> None:
+        """Elimina la tabella: serve quando si cambia modello e cambia la dimensione dei vettori."""
+        if self._has(kind):
+            self._db.drop_table(self._table_name(kind))
+
     def count(self, kind: str) -> int:
         if not self._has(kind):
             return 0

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from sqlmodel import Session, func, select
 
 from bookwriter.db.project_schema import (
@@ -74,3 +75,19 @@ def test_rebuild_reorder_move_remove_rename(tmp_path: Path) -> None:
         assert ses.exec(select(func.count()).select_from(Node)).one() == 4
         # Nessun capitolo orfano.
         assert ses.exec(select(func.count()).select_from(OutlineChapter)).one() == 2
+
+
+def test_rename_outline_changes_the_exported_book_title(tmp_path: Path) -> None:
+    """Il nome della struttura è il titolo in testa al libro: deve essere modificabile."""
+    from bookwriter.exporter import outline_to_markdown
+    from bookwriter.organize import rename_outline
+
+    db = tmp_path / "p.db"
+    oid, _nodi = _seed(db)
+    assert outline_to_markdown(db, oid).startswith("# ")
+
+    rename_outline(db, oid, "  Il filo del racconto  ")
+    assert outline_to_markdown(db, oid).startswith("# Il filo del racconto")
+
+    with pytest.raises(ValueError):
+        rename_outline(db, oid, "   ")

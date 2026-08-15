@@ -43,38 +43,72 @@ class SupportsChatJson(Protocol):
         ...
 
 
+_SYSTEM = (
+    "Analizza la coerenza del testo di un libro. Restituisci: 'mappings' (nomi propri/termini "
+    "resi in modo INCOERENTE: 'canonical' + 'variants' da uniformare, solo vere varianti dello "
+    "stesso referente), 'timeline_issues' (incoerenze cronologiche o di continuità), "
+    "'repetitions' (concetti/frasi ripetuti in modo ridondante)."
+)
+
+# Ampiezza della finestra di lettura. Sta larga dentro il contesto dei modelli in uso e tiene
+# insieme abbastanza pagine da far emergere le varianti di uno stesso nome.
+_WINDOW_CHARS = 60_000
+
+
+def _windows(text: str, size: int) -> list[str]:
+    """Divide il testo in finestre di lettura, tagliando su un a capo per non spezzare le frasi."""
+    if len(text) <= size:
+        return [text] if text.strip() else []
+    parti: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        if end < len(text):
+            taglio = text.rfind("\n", start + size // 2, end)
+            if taglio > start:
+                end = taglio
+        pezzo = text[start:end]
+        if pezzo.strip():
+            parti.append(pezzo)
+        start = end
+    return parti
+
+
 def analyze_coherence(text: str, client: SupportsChatJson, *, model: str | None = None) -> dict:
-    """Analizza la coerenza del libro: mappa nomi/termini + problemi di timeline + ripetizioni."""
-    result = client.chat_json(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "Analizza la coerenza del testo di un libro. Restituisci: 'mappings' (nomi propri/termini "
-                    "resi in modo INCOERENTE: 'canonical' + 'variants' da uniformare, solo vere varianti dello "
-                    "stesso referente), 'timeline_issues' (incoerenze cronologiche o di continuità), "
-                    "'repetitions' (concetti/frasi ripetuti in modo ridondante)."
-                ),
-            },
-            {"role": "user", "content": text[:8000]},
-        ],
-        schema=COHERENCE_SCHEMA,
-        model=model,
-    )
+    """Analizza la coerenza del libro: mappa nomi/termini + problemi di timeline + ripetizioni.
+
+    Il testo viene percorso **tutto**, a finestre. Analizzarne solo l'inizio (com'era prima:
+    i primi 8.000 caratteri, cioè un paio di pagine) e poi applicare le sostituzioni trovate
+    all'intero volume significa uniformare il libro sulla base dell'uno per cento del libro:
+    le incoerenze del resto restano, e le sostituzioni decise su un campione così stretto
+    finiscono comunque su ogni pagina.
+    """
     mapping: dict[str, str] = {}
-    for m in result.get("mappings", []):
-        canonical = str(m.get("canonical", "")).strip()
-        if not canonical:
-            continue
-        for variant in m.get("variants", []) or []:
-            variant = str(variant).strip()
-            if variant and variant != canonical:
-                mapping[variant] = canonical
-    return {
-        "mappings": mapping,
-        "timeline_issues": [str(x) for x in (result.get("timeline_issues") or [])],
-        "repetitions": [str(x) for x in (result.get("repetitions") or [])],
-    }
+    timeline: list[str] = []
+    repetitions: list[str] = []
+    for finestra in _windows(text, _WINDOW_CHARS):
+        result = client.chat_json(
+            [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": finestra}],
+            schema=COHERENCE_SCHEMA,
+            model=model,
+        )
+        for m in result.get("mappings", []):
+            canonical = str(m.get("canonical", "")).strip()
+            if not canonical:
+                continue
+            for variant in m.get("variants", []) or []:
+                variant = str(variant).strip()
+                # La prima resa vince, come per il glossario: due finestre che scelgono forme
+                # canoniche diverse per lo stesso nome si annullerebbero a vicenda.
+                if variant and variant != canonical and variant not in mapping:
+                    mapping[variant] = canonical
+        for issue in result.get("timeline_issues") or []:
+            if str(issue) not in timeline:
+                timeline.append(str(issue))
+        for rep in result.get("repetitions") or []:
+            if str(rep) not in repetitions:
+                repetitions.append(str(rep))
+    return {"mappings": mapping, "timeline_issues": timeline, "repetitions": repetitions}
 
 
 def extract_canonical_map(text: str, client: SupportsChatJson, *, model: str | None = None) -> dict[str, str]:

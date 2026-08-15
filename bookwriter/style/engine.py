@@ -43,13 +43,20 @@ def _card(client: SupportsLLM, system: str, user: str, model: str | None) -> dic
     )
 
 
+# Quanto testo si legge per imparare uno stile. Seimila caratteri erano due pagine: la voce di
+# un autore si riconosce sulla distanza, fra dialoghi, descrizioni e digressioni.
+_STYLE_SAMPLE_CHARS = 40_000
+
+
 def extract_style(text: str, client: SupportsLLM, *, name: str, model: str | None = None) -> StyleProfile:
     system = (
         f"Analizza lo STILE del testo (non il contenuto). Descrivi in modo conciso ciascuna "
         f"dimensione ({_DIMS_LIST}). Fornisci 2-3 exemplars (brevi frasi originali che imitano lo "
         f"stile) e i vincoli. Non copiare frasi lunghe dal testo."
     )
-    return StyleProfile.from_card(name, "extracted", _card(client, system, text[:6000], model))
+    return StyleProfile.from_card(
+        name, "extracted", _card(client, system, text[:_STYLE_SAMPLE_CHARS], model)
+    )
 
 
 def abstract_style(description: str, client: SupportsLLM, *, name: str, model: str | None = None) -> StyleProfile:

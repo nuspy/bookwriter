@@ -1,0 +1,50 @@
+bookwriter — Proprietary Licence
+Copyright (c) 2026 atain. All rights reserved.
+
+1. GRANT OF LICENCE
+
+   A non-exclusive, non-transferable licence to install and use this software is granted
+   solely to the individual who personally downloaded this package from the author's
+   Patreon page.
+
+   The licence is personal to that individual. It is not granted to anyone who obtained
+   the package in any other way, including from a friend, a colleague, a shared drive, a
+   file-sharing service, or a public repository.
+
+2. PERMITTED USE
+
+   The licensee may install the software on computers they own or control, use it for
+   their own work, and modify it for their own use.
+
+3. RESTRICTIONS
+
+   The licensee may not:
+   - redistribute, publish, share, sell, rent, lend or otherwise make the software or any
+     part of it available to any other person, in original or modified form;
+   - use the software, or any derivative of it, to provide a commercial service to third
+     parties;
+   - sublicense the software or transfer this licence to anyone else;
+   - remove or alter this licence, the copyright notice, or the author attribution.
+
+   Books, documents and other content produced with the software belong entirely to the
+   licensee. This licence places no restriction whatsoever on what is written with it.
+
+4. THIRD-PARTY COMPONENTS
+
+   The software depends on third-party packages installed separately by pip, and on a
+   language-model service (such as LM Studio) that is not part of this package. Those
+   components are governed by their own licences.
+
+5. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+   INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+   PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+   ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+   OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+6. TERMINATION
+
+   This licence terminates automatically if its terms are breached. On termination the
+   licensee must stop using the software and delete all copies of it.

@@ -74,10 +74,8 @@ Ogni stadio è un modulo indipendente con I/O su DB, così ognuno è testabile e
 | Template & export | **Jinja2** + **Pandoc** (esterno) → DOCX; **Typst** o LaTeX → PDF | Un sorgente Markdown → più formati. |
 | Concorrenza | `asyncio` + semaforo | Batching atomizzazione/embedding. |
 
-**Riuso ambiente esistente (opzionale, da valutare in Fase 1):** le skill locali `graphify`
-(input → knowledge graph → community) e `wiki-import` (LLM Wiki locale per progetti, RAG,
-import PDF/DOCX) coprono pezzi di ingestione/grafo; `bookwriter` può orchestrarle invece di
-riscrivere tutto. Decisione presa a valle di uno spike tecnico.
+**Nota di progetto:** ingestione, grafo e archivio navigabile sono implementati nel pacchetto
+senza dipendere da servizi esterni, così l'intera catena resta eseguibile in locale.
 
 ---
 
@@ -503,20 +501,20 @@ lo stile prima di elaborare l'intero libro (§8.5).
 
 | Fase | Stato | Contenuto | Esito verificabile |
 |---|---|---|---|
-| **0 — Scaffolding** | ✅ fatto | struttura progetto, client LM Studio (chat+embedding+structured output, retry), multi-progetto, `registry.db` | `project new/list/switch` + `doctor` OK (verificato) |
-| **1a — Ingestione+Chunking** | ✅ fatto | loader txt/md/pdf/docx/epub, **ingestione ricorsiva di directory** (dedup/checkpoint), **chunking deterministico**, BookSpec (target parole) | `ingest <cartella> -r` + `memory stats` (verificato: libro 8k parole → chunk) |
-| **1b — Memoria semantica** | ✅ fatto | embedding nomic + **LanceDB** + ricerca semantica `memory embed/search` | ricerca semantica corretta su corpus reale (verificato) |
-| **1c — Atomizzazione + grafo** | ✅ fatto | chunk→nodi via LLM (structured output), metadati (temi/entità/date), grafo top-k | verificato: `atomize` + `memory graph` (nodi e archi) con test verdi |
-| **2 — Organizzazione tematica + resa verbatim** | ✅ fatto | **clustering per embedding** (KMeans + auto-k silhouette) o community; outline tematica; **compilazione verbatim** (§8.0) → Markdown/DOCX (Pandoc) | verificato: corpus misto → antologia per tema pulita in DOCX/MD |
-| **3 — Interazione + Intenti (memoria)** | ✅ fatto | motore di co-scrittura (§7.6): analisi lacune, domande LLM, completamento→nuovi nodi (source=dialogue); **persistenza intenti/decisioni/sessioni** (§7.7) + brief di ripresa | verificato: `ask`/`answer` + `session brief` ricostruiscono lo stato |
-| **4 — Stile** | ✅ fatto | StyleProfile (9 dimensioni; extract/abstract/authors+pesi+blend), StyleContract, critic loop; CLI `style` + pannello GUI | verificato: estratto stile hard-boiled → applicato con trasformazione forte |
-| **5 — Stesura narrativa + Export** | ✅ fatto | compose per-capitolo (**section-aware**, capitoli→sezioni→nodi) con StyleContract + continuità, **budget parole + riconciliazione**; export **DOCX/MD/PDF** + **wiki/archivio**; CLI `compose`/`export`/`outline sections` + GUI | verificato: libro 239/250 parole; PDF valido; sezioni rese come `###` |
-| **6 — Rewrite (B)** | ✅ fatto | pipeline deterministica chunk-per-chunk, `StyleContract`+`ContinuityState` (glossario/riassunto/coda) con checkpoint resumable, **preview primo capitolo**; CLI `rewrite` + pannello GUI | verificato: libro 2 capitoli riscritto in stile fiabesco uniforme, preview + export |
-| **7 — Translate (C)** | ✅ fatto | riusa il motore di B con `mode=translate` + lingua target + glossario bilingue coerente, preview; CLI `translate` + pannello GUI | verificato: racconto IT→EN fedele, stile mantenuto, nomi coerenti |
-| **8 — Authoring interattivo (D)** | ✅ fatto | brief persistito + `expand_topic` (LLM genera idee da zero) + `author draft` (grafo→organizza→stesura→export); CLI `author` + pannello GUI | verificato: da progetto vuoto → libro di 2 capitoli, 310/300 parole |
-| **9 — Ordinamenti aggiuntivi** | ✅ fatto | **cronologico** (per date estratte), **narrativo** (arco via LLM), **custom** (criterio in linguaggio naturale); CLI `organize --ordering` + combo GUI | verificato: stessi nodi → 4 ordinamenti (tema/tempo/arco/criterio) diversi |
-| **GUI (PySide6)** | 🟡 pannelli pronti | finestra desktop: barra progetto con **contatore parole** (stimate/target), pannelli **funzionanti** (Ingestione con **drag-and-drop**, Memoria+ricerca, Organizza&Export, **Stile**, **Rewrite** e **Translate** con preview, Interazione, Brief) + **stesura narrativa** nel pannello Organizza + pannello **Authoring** + pannello **Outline (editing drag-drop: riordina/rinomina/elimina capitoli, sposta/rimuovi nodi)**, worker in background, auto-refresh al cambio tab; **tutti i pannelli attivi (nessun placeholder)** | verificato offscreen; `bookwriter gui` sul desktop |
-| **10 — Hardening scala** | ✅ fatto | **concorrenza** embedding/atomizzazione (config `concurrency`), **conteggio token**, **libreria stili globale**, **checkpoint `Job`** con progresso persistito (`jobs`), **clustering scalabile** (MiniBatchKMeans + silhouette campionata), **passaggio globale di coerenza** (glossario canonico), **ricerca sui nodi** | verificato: jobs persistiti, coerenza uniforma i nomi, ricerca semantica sui nodi |
+| **0 — Scaffolding** | ✅ fatto | struttura progetto, client LM Studio (chat+embedding+structured output, retry), multi-progetto, `registry.db` | `project new/list/switch` + `doctor` |
+| **1a — Ingestione+Chunking** | ✅ fatto | loader txt/md/pdf/docx/epub, **ingestione ricorsiva di directory** (dedup/checkpoint), **chunking deterministico**, BookSpec (target parole) | `ingest <cartella> -r` + `memory stats` su un corpus di prova |
+| **1b — Memoria semantica** | ✅ fatto | embedding nomic + **LanceDB** + ricerca semantica `memory embed/search` | ricerca semantica corretta, con test automatici |
+| **1c — Atomizzazione + grafo** | ✅ fatto | chunk→nodi via LLM (structured output), metadati (temi/entità/date), grafo top-k | `atomize` + `memory graph` producono nodi e archi, con test automatici |
+| **2 — Organizzazione tematica + resa verbatim** | ✅ fatto | **clustering per embedding** (KMeans + auto-k silhouette) o community; outline tematica; **compilazione verbatim** (§8.0) → Markdown/DOCX (Pandoc) | corpus misto → antologia per tema in DOCX/MD |
+| **3 — Interazione + Intenti (memoria)** | ✅ fatto | motore di co-scrittura (§7.6): analisi lacune, domande LLM, completamento→nuovi nodi (source=dialogue); **persistenza intenti/decisioni/sessioni** (§7.7) + brief di ripresa | `ask`/`answer` + `session brief` ricostruiscono lo stato |
+| **4 — Stile** | ✅ fatto | StyleProfile (9 dimensioni; extract/abstract/authors+pesi+blend), StyleContract, critic loop; CLI `style` + pannello GUI | profilo estratto da un testo campione e applicato a un altro testo |
+| **5 — Stesura narrativa + Export** | ✅ fatto | compose per-capitolo (**section-aware**, capitoli→sezioni→nodi) con StyleContract + continuità, **budget parole + riconciliazione**; export **DOCX/MD/PDF** + **wiki/archivio**; CLI `compose`/`export`/`outline sections` + GUI | budget di parole rispettato; PDF valido; sezioni rese come `###` |
+| **6 — Rewrite (B)** | ✅ fatto | pipeline deterministica chunk-per-chunk, `StyleContract`+`ContinuityState` (glossario/riassunto/coda) con checkpoint resumable, **preview primo capitolo**; CLI `rewrite` + pannello GUI | documento riscritto in uno stile uniforme, con anteprima ed export |
+| **7 — Translate (C)** | ✅ fatto | riusa il motore di B con `mode=translate` + lingua target + glossario bilingue coerente, preview; CLI `translate` + pannello GUI | traduzione fedele con stile mantenuto e nomi coerenti |
+| **8 — Authoring interattivo (D)** | ✅ fatto | brief persistito + `expand_topic` (LLM genera idee da zero) + `author draft` (grafo→organizza→stesura→export); CLI `author` + pannello GUI | da progetto vuoto a libro completo, budget di parole rispettato |
+| **9 — Ordinamenti aggiuntivi** | ✅ fatto | **cronologico** (per date estratte), **narrativo** (arco via LLM), **custom** (criterio in linguaggio naturale); CLI `organize --ordering` + combo GUI | stessi contenuti → quattro ordinamenti diversi |
+| **GUI (PySide6)** | 🟡 pannelli pronti | finestra desktop: barra progetto con **contatore parole** (stimate/target), pannelli **funzionanti** (Ingestione con **drag-and-drop**, Memoria+ricerca, Organizza&Export, **Stile**, **Rewrite** e **Translate** con preview, Interazione, Brief) + **stesura narrativa** nel pannello Organizza + pannello **Authoring** + pannello **Outline (editing drag-drop: riordina/rinomina/elimina capitoli, sposta/rimuovi nodi)**, worker in background, auto-refresh al cambio tab; **tutti i pannelli attivi (nessun placeholder)** | costruzione verificata offscreen dai test |
+| **10 — Hardening scala** | ✅ fatto | **concorrenza** embedding/atomizzazione (config `concurrency`), **conteggio token**, **libreria stili globale**, **checkpoint `Job`** con progresso persistito (`jobs`), **clustering scalabile** (MiniBatchKMeans + silhouette campionata), **passaggio globale di coerenza** (glossario canonico), **ricerca sui nodi** | job persistiti, nomi uniformati, ricerca semantica sulle sezioni |
 
 ---
 
@@ -530,26 +528,37 @@ lo stile prima di elaborare l'intero libro (§8.5).
 
 ---
 
-## 12.5 Setup LM Studio rilevato (2026-07-24) e taratura risultante
+## 12.5 Requisiti dei modelli e taratura
 
-Verifica eseguita su `http://localhost:1234` — chat ed embedding funzionanti.
+Il programma richiede un servizio compatibile con l'API OpenAI: LM Studio in locale
+(`http://localhost:1234/v1`) oppure un fornitore nel cloud. Servono due ruoli:
 
-- **Modello reasoning/chat/stesura (default):** `gemma-4-12b-obliterated` — 131k ctx, Q8_0, `tool_use`.
-- **Modello embedding (default):** `text-embedding-nomic-embed-text-v1.5` — **768 dim**, **ctx max 2048 token**.
-- **Disponibili (non caricati)** per job pesanti/alta qualità: `nemotron-cascade-2-30b-a3b` e
-  `nvidia/nemotron-3-nano` (ctx **1M**), `qwen3-coder-next`, vari 30–35B. Il design **non dipende**
-  da contesti lunghi (continuità via stato esplicito), ma sono un'opzione.
+- **reasoning/chat/stesura** — un modello *instruct* qualsiasi, purché supporti lo **structured
+  output** (`response_format: json_schema`). Il contesto richiesto è modesto: la continuità è
+  mantenuta da uno stato esplicito, non dalla finestra del modello.
+- **embedding** — un modello di embedding; per corpus non inglesi conviene sceglierne uno
+  multilingue, perché da questi vettori dipendono ricerca, raggruppamento in capitoli e grafo.
+- **heavy** (facoltativo) — un modello più grande usato solo per i passaggi di qualità
+  (controllo di stile, coerenza globale).
+
+I nomi dei modelli sono valori di configurazione, non scelte cablate: si impostano dalla scheda
+Impostazioni o in `config.toml`, per progetto.
 
 **Taratura derivata:**
-1. **Budget chunk ≈ 1500 token** (sotto il cap embedding 2048; buona granularità per atomizzazione/riscrittura). Parametrico in `config.toml`.
-2. **Prefissi nomic**: indicizzare i nodi con `search_document:` e le query con `search_query:` (qualità retrieval).
-3. **Structured output** via `response_format: {type:"json_schema", …}` di LM Studio per metadati/StyleCard/outline (non affidarsi al prompt: il modello tende a incorniciare in ```json).
-4. **Ruoli modello configurabili per progetto** in `config.toml` (reasoning / embedding / eventuale modello "heavy" per revisione globale).
+1. **Budget chunk ≈ 1500 token**, sotto il cap tipico dei modelli di embedding e con buona
+   granularità per segmentazione e riscrittura. Parametrico in `config.toml`.
+2. **Prefissi per famiglia di embedding**: ogni famiglia vuole i suoi (`search_document:`/
+   `search_query:` per nomic, nessuno per bge-m3, `passage:`/`query:` per e5…). Sono applicati
+   automaticamente in base al modello scelto: usare quelli sbagliati peggiora il recupero.
+3. **Structured output** via `response_format: {type:"json_schema", …}` per metadati, StyleCard e
+   outline: non affidarsi al prompt, perché il modello tende a incorniciare la risposta in ```json.
+4. **Ruoli modello configurabili per progetto** in `config.toml` (reasoning / embedding / heavy).
+5. **Nessun tetto ai token** sulle richieste di stesura: sui modelli che ragionano il pensiero
+   consuma il budget prima che inizi il testo, e la risposta tornerebbe vuota.
 
-## 13. Prossimo passo operativo
+## 13. Stato
 
-Fase 0 → 1: scaffolding del progetto + client LM Studio + `project`/`ingest`/`memory` minimi,
-poi spike per decidere se agganciare `graphify`/`wiki-import` o implementare i loader nativi.
-Prima però conviene **verificare LM Studio** (attivo? quali modelli chat+embedding caricati?) per
-tarare lo stack su ciò che hai realmente in locale.
+Le fasi 0–10 della roadmap sono realizzate e coperte da test automatici. Gli sviluppi successivi
+(segmentazione in sezioni, aggiornamento di una bozza esistente, interfaccia multilingua, scelta del
+fornitore) sono documentati nel codice e nei test dei rispettivi moduli.
 ```

@@ -7,6 +7,7 @@ store vettoriale (join per ``id``), a batch. La ricerca embedda la query con il 
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -28,9 +29,11 @@ class EmbedReport:
     embedded: int
     already: int
     batches: int
+    rebuilt: bool = False  # True se il cambio di modello ha imposto di rifare tutto
 
     def summary(self) -> str:
-        return f"embeddati={self.embedded} · già presenti={self.already} · batch={self.batches}"
+        base = f"embeddati={self.embedded} · già presenti={self.already} · batch={self.batches}"
+        return base + " · indice rifatto (modello cambiato)" if self.rebuilt else base
 
 
 @dataclass
@@ -42,6 +45,46 @@ class SearchHit:
     chapter_ref: str | None
 
 
+def _stamp_path(vectors_path: Path) -> Path:
+    """File che ricorda con quale modello è stato costruito ogni indice."""
+    return vectors_path.parent / "vectors.models.json"
+
+
+def _read_stamp(vectors_path: Path) -> dict[str, str]:
+    try:
+        return json.loads(_stamp_path(vectors_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_stamp(vectors_path: Path, kind: str, model_id: str) -> None:
+    data = _read_stamp(vectors_path)
+    data[kind] = model_id
+    _stamp_path(vectors_path).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _reset_if_model_changed(
+    store: LanceStore, kind: str, client: SupportsEmbed, vectors_path: Path, model_id: str
+) -> bool:
+    """Se il modello di embedding è cambiato, i vettori vecchi non sono più confrontabili.
+
+    Due modelli diversi collocano gli stessi testi in spazi diversi: mescolarli renderebbe
+    ricerca e raggruppamenti senza senso. Si riconosce il cambio dal nome registrato e, come
+    rete di sicurezza, dalla dimensione dei vettori (una sola chiamata di sonda).
+    """
+    stored_dim = store.dimension(kind)
+    if stored_dim is None:
+        return False
+    previous = _read_stamp(vectors_path).get(kind, "")
+    if model_id and previous and model_id != previous:
+        store.drop(kind)
+        return True
+    if len(client.embed(["x"], kind="query")[0]) != stored_dim:
+        store.drop(kind)
+        return True
+    return False
+
+
 def _embed_items(
     store: LanceStore,
     kind: str,
@@ -50,12 +93,19 @@ def _embed_items(
     batch_size: int,
     concurrency: int,
     progress,
+    vectors_path: Path | None = None,
+    model_id: str = "",
 ) -> EmbedReport:
+    rebuilt = (
+        _reset_if_model_changed(store, kind, client, vectors_path, model_id)
+        if vectors_path is not None
+        else False
+    )
     existing = store.existing_ids(kind)
     todo = [(i, t) for i, t in items if i not in existing]
     total = len(todo)
     if not total:
-        return EmbedReport(embedded=0, already=len(existing), batches=0)
+        return EmbedReport(embedded=0, already=len(existing), batches=0, rebuilt=rebuilt)
 
     batches = [todo[s : s + batch_size] for s in range(0, total, batch_size)]
     done = 0
@@ -67,7 +117,9 @@ def _embed_items(
         done += len(batch)
         if progress:
             progress(done, total)
-    return EmbedReport(embedded=total, already=len(existing), batches=len(batches))
+    if vectors_path is not None and model_id:
+        _write_stamp(vectors_path, kind, model_id)
+    return EmbedReport(embedded=total, already=len(existing), batches=len(batches), rebuilt=rebuilt)
 
 
 def embed_chunks(
@@ -78,12 +130,13 @@ def embed_chunks(
     batch_size: int = 32,
     concurrency: int = 4,
     progress=None,
+    model_id: str = "",
 ) -> EmbedReport:
     store = LanceStore(vectors_path)
     engine = make_engine(db_path)
     with Session(engine) as ses:
         items = [(cid, text) for cid, text in ses.exec(select(Chunk.id, Chunk.text)).all()]
-    return _embed_items(store, "chunk", items, client, batch_size, concurrency, progress)
+    return _embed_items(store, "chunk", items, client, batch_size, concurrency, progress, vectors_path, model_id)
 
 
 def _node_representation(node: Node) -> str:
@@ -101,13 +154,14 @@ def embed_nodes(
     batch_size: int = 32,
     concurrency: int = 4,
     progress=None,
+    model_id: str = "",
 ) -> EmbedReport:
     """Embedding dei nodi (sintesi+temi+testo) per clustering tematico e grafo."""
     store = LanceStore(vectors_path)
     engine = make_engine(db_path)
     with Session(engine) as ses:
         items = [(n.id, _node_representation(n)) for n in ses.exec(select(Node)).all()]
-    return _embed_items(store, "node", items, client, batch_size, concurrency, progress)
+    return _embed_items(store, "node", items, client, batch_size, concurrency, progress, vectors_path, model_id)
 
 
 def search_nodes(

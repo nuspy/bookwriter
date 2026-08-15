@@ -3,7 +3,8 @@
 Regole:
 - i chunk **tassellano** il testo senza sovrapposizione → ricomposizione esatta (`book_pos`);
 - non si spezza mai una frase; si preferiscono i confini di paragrafo;
-- un titolo (heading) apre sempre un nuovo chunk (i capitoli non si fondono);
+- un titolo (heading) apre un nuovo chunk **solo se quello in corso ha già sostanza**: vedi
+  ``_HEADING_MIN_SHARE``;
 - un paragrafo più grande del budget viene diviso per frasi; una frase enorme, per parole;
 - budget in token = euristica deterministica (vedi ``text_utils.count_tokens``), sotto il cap 2048.
 Puro e ripetibile: stesso input → stessi chunk.
@@ -15,6 +16,20 @@ from dataclasses import dataclass
 
 from bookwriter.ingest.structure import Block
 from bookwriter.text_utils import count_tokens, split_sentences
+
+
+# Quanto deve essere pieno il chunk in corso perché un titolo ne apra uno nuovo.
+#
+# La regola di prima — «un titolo apre sempre un chunk» — nasceva per non fondere i capitoli
+# quando la struttura del libro viveva solo qui dentro. Ora la struttura viaggia a parte
+# (``bookwriter.layout``) e i titoli tornano al loro posto comunque: spezzare a ogni intestazione
+# è rimasto un costo senza contropartita. Su un documento molto titolato produceva brani da un
+# centinaio di token, e ogni brano costa al modello alcune migliaia di token di ragionamento
+# **qualunque sia la sua taglia**: si finiva per pagare il pensiero, non la traduzione.
+#
+# A metà budget il compromesso tiene: le sezioni brevi si accumulano, e un capitolo che comincia
+# quando il brano è già sostanzioso apre comunque il suo.
+_HEADING_MIN_SHARE = 0.5
 
 
 @dataclass
@@ -124,8 +139,11 @@ def chunk_document(
             )
         )
 
+    stacco_titolo = target_tokens * _HEADING_MIN_SHARE
     for unit in units:
-        starts_new = current and (unit.is_heading or current_tokens + unit.tokens > target_tokens)
+        pieno = current_tokens + unit.tokens > target_tokens
+        nuovo_capitolo = unit.is_heading and current_tokens >= stacco_titolo
+        starts_new = current and (pieno or nuovo_capitolo)
         if starts_new:
             flush()
             current = []

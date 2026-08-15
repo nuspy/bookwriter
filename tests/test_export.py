@@ -57,3 +57,33 @@ def test_export_wiki(tmp_path: Path) -> None:
     assert "<svg" in html and 'href="#n' in html  # grafo SVG con link ai nodi
     data = json.loads(result["json"].read_text(encoding="utf-8"))
     assert len(data["nodes"]) == 2 and len(data["edges"]) == 1
+
+
+def test_export_filename_describes_the_variant() -> None:
+    """Ogni variante prodotta ha un nome diverso: non si sovrascrivono a vicenda."""
+    from bookwriter.exporter import export_filename
+
+    assert export_filename("quaderno", style="Hemingway Doyle", language="hu", words=80000) == (
+        "quaderno_Hemingway-Doyle_HU_80k.docx"
+    )
+    assert export_filename("quaderno", qualifier="antologia", language="hu", ext="md") == (
+        "quaderno_antologia_HU.md"
+    )
+    # Tradurre sostituisce la sigla di lingua invece di accodarne una seconda.
+    assert export_filename("appunti_prosa_IT", language="en") == "appunti_prosa_EN.docx"
+    # Caratteri vietati dal filesystem e spazi non passano.
+    assert export_filename('Il filo: del/racconto', style="Hemingway Doyle", language="it") == (
+        "Il-filo-delracconto_Hemingway-Doyle_IT.docx"
+    )
+    # Senza dettagli resta il nome nudo.
+    assert export_filename("quaderno") == "quaderno.docx"
+
+
+def test_language_tag_from_free_text() -> None:
+    from bookwriter.config import language_tag
+
+    assert language_tag("inglese") == "EN"
+    assert language_tag("en") == "EN"
+    assert language_tag("ungherese (magyar)") == "HU"
+    assert language_tag("magyar") == "HU"
+    assert language_tag("") == ""

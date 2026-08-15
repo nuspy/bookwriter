@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bookwriter"
-version = "0.0.1"
+version = "0.1.0"
 description = "Trasforma frammenti sparsi (o interi libri) in un libro/archivio con LLM locale (LM Studio)"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
+license = { file = "LICENSE" }
 authors = [{ name = "atain" }]
 dependencies = [
     # CLI e config
@@ -47,6 +47,10 @@ bookwriter = "bookwriter.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["bookwriter*"]
+
+[tool.setuptools.package-data]
+# I cataloghi di traduzione dell'interfaccia viaggiano col pacchetto.
+"bookwriter.gui" = ["locales/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

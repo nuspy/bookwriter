@@ -25,12 +25,50 @@ _HEADING_NUMBERED = re.compile(
 )
 
 
+# Punti di guida degli indici («Capitolo 1 . . . . . . 12», anche con trattini o underscore).
+# Estratti da un PDF diventano righe lunghissime di sola punteggiatura: non portano contenuto,
+# gonfiano i blocchi e mandano i modelli in ripetizione senza fine. Si riducono a un segno solo.
+_DOT_LEADERS = re.compile(r"(?:[.·•_-][ \t]*){5,}")
+
+# Riga separatrice di una tabella Markdown: `|---|---|`, `| :--- | ---: |`, e simili. È fatta
+# di trattini, quindi la regola dei punti di guida la prenderebbe in pieno — e senza quella riga
+# la tabella smette di essere una tabella per qualunque lettore di Markdown.
+_TABLE_RULE = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|[\s:|-]*$")
+
+
+def _is_table_rule(line: str) -> bool:
+    """Vero se la riga è la separatrice di intestazione di una tabella, non un fregio di puntini."""
+    nuda = line.strip()
+    return bool(nuda) and "|" in nuda and "-" in nuda and bool(_TABLE_RULE.match(nuda))
+
+
 def normalize_text(text: str) -> str:
-    """Uniforma i fine-riga, elimina spazi finali e comprime le righe vuote multiple."""
+    """Uniforma i fine-riga, elimina spazi finali, comprime righe vuote e punti di guida.
+
+    I punti di guida si riducono riga per riga, saltando le separatrici delle tabelle: quei
+    trattini non sono un indice, sono ciò che tiene in piedi la tabella.
+    """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "\n".join(
+        riga if _is_table_rule(riga) else _DOT_LEADERS.sub(" … ", riga)
+        for riga in text.split("\n")
+    )
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def has_prose(text: str) -> bool:
+    """True se il passaggio contiene davvero del testo da far elaborare a un modello.
+
+    L'indice di un PDF è fatto di punti di guida e numeri di pagina, il colophon di sigle e
+    date: non c'è nulla da atomizzare, tradurre o riscrivere. Darli al modello non è solo
+    lavoro sprecato, è il caso in cui entra in ripetizione senza fine. La prosa sta ben sopra
+    il 60% di lettere; un indice molto sotto.
+    """
+    if not text.strip():
+        return False
+    return sum(ch.isalpha() for ch in text) >= 0.35 * len(text)
 
 
 def count_tokens(text: str) -> int:

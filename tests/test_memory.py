@@ -80,3 +80,38 @@ def test_search_returns_relevant(tmp_path: Path) -> None:
     assert hits, "attesi risultati"
     assert "a" in hits[0].text  # il chunk ricco di 'a' è il più vicino
     assert hits[0].document_title == "Doc"
+
+
+def test_embedding_rebuilds_index_when_model_changes(tmp_path) -> None:
+    """Cambiando modello i vettori vecchi non sono confrontabili: l'indice va rifatto."""
+    from bookwriter.memory.embedder import _embed_items
+    from bookwriter.memory.vectors import LanceStore
+
+    class FixedDim:
+        def __init__(self, dim: int) -> None:
+            self.dim = dim
+
+        def embed(self, texts, *, kind="document", model=None):
+            return [[0.1] * self.dim for _ in texts]
+
+    vectors = tmp_path / "v.lance"
+    store = LanceStore(vectors)
+    items = [(1, "uno"), (2, "due")]
+
+    first = _embed_items(store, "chunk", items, FixedDim(768), 32, 1, None, vectors, "nomic-v1")
+    assert first.embedded == 2 and first.rebuilt is False
+    assert store.dimension("chunk") == 768
+
+    # Stesso modello: niente da rifare.
+    again = _embed_items(store, "chunk", items, FixedDim(768), 32, 1, None, vectors, "nomic-v1")
+    assert again.embedded == 0 and again.rebuilt is False
+
+    # Modello diverso ma stessa dimensione: si riconosce dal nome registrato.
+    renamed = _embed_items(store, "chunk", items, FixedDim(768), 32, 1, None, vectors, "nomic-v2")
+    assert renamed.rebuilt is True and renamed.embedded == 2
+
+    # Dimensione diversa: rete di sicurezza anche senza nome del modello.
+    switched = _embed_items(store, "chunk", items, FixedDim(1024), 32, 1, None, vectors)
+    assert switched.rebuilt is True and switched.embedded == 2
+    assert store.dimension("chunk") == 1024
+    assert "indice rifatto" in switched.summary()

@@ -34,3 +34,13 @@ def test_looks_like_heading() -> None:
     assert looks_like_heading("CAPITOLO PRIMO")[0] is True
     assert looks_like_heading("Capitolo 3 — Il ritorno")[0] is True
     assert looks_like_heading("Questa è una frase normale con un punto.")[0] is False
+
+
+def test_dot_leaders_of_an_index_are_collapsed() -> None:
+    """I punti di guida di un indice PDF non portano contenuto e fanno ripetere i modelli."""
+    riga = "Capitolo 1 . . . . . . . . . . . . . . . . 12"
+    normalizzato = normalize_text(riga)
+    assert ". . . ." not in normalizzato
+    assert normalizzato.startswith("Capitolo 1") and normalizzato.endswith("12")
+    # Una punteggiatura normale resta intatta.
+    assert normalize_text("Ecco... e poi?") == "Ecco... e poi?"

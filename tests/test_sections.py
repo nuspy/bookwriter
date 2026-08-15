@@ -1,4 +1,4 @@
-"""Test della suddivisione dei capitoli in sezioni."""
+"""Test della segmentazione in sezioni (taglio deterministico + etichettatura senza rete)."""
 
 from __future__ import annotations
 
@@ -6,66 +6,96 @@ from pathlib import Path
 
 from sqlmodel import Session, select
 
-from bookwriter.db.project_schema import (
-    Node,
-    Outline,
-    OutlineChapter,
-    OutlineItem,
-    init_project_db,
-    make_engine,
+from bookwriter.atomize.sections import (
+    build_label_prompt,
+    build_sections,
+    plan_sections,
+    split_into_sections,
 )
-from bookwriter.exporter import outline_to_markdown
-from bookwriter.memory.vectors import LanceStore
-from bookwriter.organize.sections import subdivide_sections
+from bookwriter.db.project_schema import Chunk, Document, Node, init_project_db, make_engine
+
+PAR = ["Primo paragrafo con alcune parole dentro."] * 4
 
 
-def _seed(db_path: Path, vectors: Path) -> int:
+def _seed(db_path: Path, testi: list[str]) -> None:
     init_project_db(db_path)
-    engine = make_engine(db_path)
-    with Session(engine) as ses:
-        nodes = [Node(raw_text=f"Nodo {i}", summary=f"Nodo {i}") for i in range(6)]
-        ses.add_all(nodes)
+    with Session(make_engine(db_path)) as ses:
+        doc = Document(path="x", format="txt", sha256="d", title="D")
+        ses.add(doc); ses.commit(); ses.refresh(doc)
+        for i, testo in enumerate(testi):
+            ses.add(Chunk(document_id=doc.id, book_pos=i, text=testo, sha256=f"c{i}"))
         ses.commit()
-        for n in nodes:
-            ses.refresh(n)
-        o = Outline(name="O")
-        ses.add(o)
-        ses.commit()
-        ses.refresh(o)
-        ch = OutlineChapter(outline_id=o.id, position=0, title="Cap")
-        ses.add(ch)
-        ses.commit()
-        ses.refresh(ch)
-        for pos, n in enumerate(nodes):
-            ses.add(OutlineItem(chapter_id=ch.id, position=pos, node_id=n.id))
-        ses.commit()
-        node_ids = [n.id for n in nodes]
-        outline_id = o.id
-    # Vettori: due sotto-gruppi netti.
-    store = LanceStore(vectors)
-    store.add("node", [
-        {"id": node_ids[0], "text": "a", "vector": [1.0, 0.0]},
-        {"id": node_ids[1], "text": "a", "vector": [0.95, 0.05]},
-        {"id": node_ids[2], "text": "a", "vector": [0.9, 0.1]},
-        {"id": node_ids[3], "text": "b", "vector": [0.0, 1.0]},
-        {"id": node_ids[4], "text": "b", "vector": [0.05, 0.95]},
-        {"id": node_ids[5], "text": "b", "vector": [0.1, 0.9]},
-    ])
-    return outline_id
 
 
-def test_subdivide_and_render(tmp_path: Path) -> None:
+def test_split_never_breaks_a_paragraph_and_keeps_all_text() -> None:
+    testo = "\n\n".join(PAR)
+    sezioni = split_into_sections(testo, target_words=12)
+    assert len(sezioni) >= 2
+    # Nessun paragrafo spezzato e nessuna parola persa o duplicata.
+    assert "\n\n".join(sezioni).split() == testo.split()
+    for s in sezioni:
+        for blocco in s.split("\n\n"):
+            assert blocco in PAR
+
+
+def test_split_attaches_a_short_tail_instead_of_leaving_it_alone() -> None:
+    testo = "\n\n".join(PAR[:3] + ["Coda."])
+    sezioni = split_into_sections(testo, target_words=12)
+    assert not any(s.strip() == "Coda." for s in sezioni)
+    assert sezioni[-1].endswith("Coda.")
+
+
+def test_plan_removes_the_sentence_shared_between_two_blocks(tmp_path: Path) -> None:
+    """Il chunking sovrappone una frase: non deve comparire due volte nelle sezioni."""
+    primo = "Alfa uno. Beta due. Gamma tre."
+    secondo = "Gamma tre. Delta quattro. Epsilon cinque."
     db = tmp_path / "p.db"
-    vectors = tmp_path / "v.lance"
-    oid = _seed(db, vectors)
-    report = subdivide_sections(db, vectors, oid, client=None, max_per_chapter=2)
-    assert report["sections"] >= 2
+    _seed(db, [primo, secondo])
 
-    engine = make_engine(db)
-    with Session(engine) as ses:
-        items = ses.exec(select(OutlineItem)).all()
-    assert all(it.section_id is not None for it in items)  # tutti assegnati a una sezione
+    planned = plan_sections(db, target_words=3)
+    testo = " ".join(t for _, t in planned)
+    assert testo.count("Gamma tre.") == 1
+    assert "Delta quattro." in testo and "Alfa uno." in testo
 
-    md = outline_to_markdown(db, oid)
-    assert "### " in md  # le sezioni compaiono come sotto-intestazioni
-    assert md.count("Nodo") == 6  # tutti i nodi presenti
+
+class LabelClient:
+    """Descrive la sezione senza mai restituirne il testo."""
+
+    def __init__(self) -> None:
+        self.visti: list[str] = []
+
+    def chat_json(self, messages, *, schema, model=None, reasoning_effort=""):
+        self.visti.append(messages[1]["content"])
+        return {"title": "Titolo", "summary": "Di cosa parla.", "themes": ["  Tema ", "tema", "Altro"],
+                "entities": ["Anna"], "event_date": None, "salience": 0.8}
+
+
+def test_build_sections_stores_original_text_and_labels(tmp_path: Path) -> None:
+    testo = "\n\n".join(PAR)
+    db = tmp_path / "p.db"
+    _seed(db, [testo])
+    client = LabelClient()
+
+    rep = build_sections(db, client, target_words=12)
+    assert rep.sections == rep.labelled >= 2
+    assert rep.coverage_pct == 100
+    assert "copertura=100%" in rep.summary()
+
+    with Session(make_engine(db)) as ses:
+        nodi = ses.exec(select(Node)).all()
+    assert len(nodi) == rep.labelled
+    # Il testo salvato è quello originale, non quello del modello.
+    assert " ".join(n.raw_text for n in nodi).split() == testo.split()
+    assert nodi[0].summary.startswith("Titolo — ")
+    assert nodi[0].themes == ["tema", "altro"]  # minuscolo, senza doppioni
+    assert nodi[0].entities == ["Anna"]
+
+    # Seconda esecuzione: i blocchi già fatti vengono saltati.
+    assert build_sections(db, client, target_words=12).sections == 0
+
+
+def test_label_prompt_forbids_rewriting_and_fixes_the_language() -> None:
+    prompt = build_label_prompt("hu")
+    assert "NON riscriverla" in prompt
+    assert "ungherese (magyar)" in prompt
+    assert "nella stessa lingua del testo" in build_label_prompt("")

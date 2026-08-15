@@ -86,9 +86,14 @@ def ingest_paths(
     recursive: bool = False,
     include: list[str] | None = None,
     exclude: list[str] | None = None,
+    transient: bool = False,
     progress=None,
 ) -> IngestReport:
-    """Importa i documenti dai path indicati. ``progress`` è un callback opzionale ``(done, total, name)``."""
+    """Importa i documenti dai path indicati. ``progress`` è un callback opzionale ``(done, total, name)``.
+
+    Con ``transient=True`` i documenti entrano come materiale di lavoro: restano usabili per
+    tutta la sessione ma non fanno parte delle fonti del progetto e spariscono alla riapertura.
+    """
     files = iter_files(paths, recursive=recursive, include=include, exclude=exclude)
     report = IngestReport()
     engine = make_engine(db_path)
@@ -102,6 +107,16 @@ def ingest_paths(
                 digest = _sha256_bytes(path.read_bytes())
                 if digest in existing:
                     report.skipped.append(str(path))
+                    if not transient:
+                        # Lo stesso file già presente come documento di lavoro, ora importato
+                        # davvero: da qui in poi è una fonte del progetto e non va più cancellato.
+                        for row in ses.exec(
+                            select(Document).where(Document.sha256 == digest)
+                        ).all():
+                            if row.transient:
+                                row.transient = False
+                                ses.add(row)
+                        ses.commit()
                     continue
                 doc = load_document(path)
                 blocks = parse_structure(doc.raw_text)
@@ -113,6 +128,10 @@ def ingest_paths(
                     sha256=digest,
                     title=doc.title,
                     char_count=len(doc.raw_text),
+                    transient=transient,
+                    # Lo scheletro viaggia col documento: senza, alla riconsegna non si saprebbe
+                    # più dove stavano titoli, stacchi di pagina e corsivi.
+                    meta={"layout": doc.layout.to_dict()} if doc.layout else {},
                 )
                 ses.add(row)
                 ses.commit()

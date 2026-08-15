@@ -43,7 +43,7 @@ def test_switch_and_info(temp_workspace: Path) -> None:
     assert pm.active_slug() == "uno"
     info = pm.info("uno")
     assert info["active"] is True
-    assert info["reasoning_model"] == "gemma-4-12b-obliterated"
+    assert info["reasoning_model"] == "qwen3-8b-instruct"
 
 
 def test_switch_unknown_raises(temp_workspace: Path) -> None:

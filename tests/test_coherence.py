@@ -51,3 +51,25 @@ def test_coherence_pass_compose(tmp_path: Path) -> None:
     with Session(engine) as ses:
         texts = [r.text for r in ses.exec(select(ComposedChapter).order_by(ComposedChapter.position))]
     assert texts == ["Luca arriva.", "Luca parte."]
+
+
+def test_the_whole_book_is_read_not_just_its_opening() -> None:
+    """Le sostituzioni finiscono su ogni pagina: decidere leggendo solo l'inizio è arbitrario."""
+
+    class WindowSpyClient:
+        def __init__(self) -> None:
+            self.letto = 0
+
+        def chat_json(self, messages, *, schema, model=None):
+            testo = messages[-1]["content"]
+            self.letto += len(testo)
+            # Ogni finestra segnala una variante diversa: solo leggendole tutte si trovano.
+            canonica = "Fine" if "epilogo" in testo else "Luca"
+            return {"mappings": [{"canonical": canonica, "variants": [f"{canonica}-var"]}]}
+
+    testo = "Luka cammina nel bosco.\n" * 4000 + "\nQui comincia l'epilogo del libro.\n"
+    client = WindowSpyClient()
+    mapping = extract_canonical_map(testo, client)
+
+    assert client.letto >= len(testo) * 0.99  # letto tutto, non i primi 8.000 caratteri
+    assert "Fine-var" in mapping  # anche la variante che compare solo in fondo

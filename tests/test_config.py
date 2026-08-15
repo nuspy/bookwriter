@@ -13,7 +13,7 @@ def test_workspace_root_uses_env(temp_workspace: Path) -> None:
 
 def test_defaults_match_lmstudio_setup() -> None:
     cfg = AppConfig()
-    assert cfg.llm.models.reasoning == "gemma-4-12b-obliterated"
+    assert cfg.llm.models.reasoning == "qwen3-8b-instruct"
     assert cfg.llm.models.embedding == "text-embedding-nomic-embed-text-v1.5"
     assert cfg.embedding.max_tokens == 2048
     assert cfg.chunking.target_tokens < cfg.embedding.max_tokens
@@ -44,3 +44,22 @@ def test_merge_project_override_wins() -> None:
     assert merged.chunking.target_tokens == 900
     # I campi non toccati restano ai default globali.
     assert merged.llm.models.embedding == "text-embedding-nomic-embed-text-v1.5"
+
+
+def test_embedding_profile_matches_model_family() -> None:
+    """I prefissi seguono la famiglia del modello: usarne altri peggiora la ricerca."""
+    from bookwriter.config import embedding_profile
+
+    nomic = embedding_profile("text-embedding-nomic-embed-text-v1.5")
+    assert nomic is not None and nomic.doc_prefix == "search_document: "
+
+    bge = embedding_profile("bge-m3")
+    assert bge is not None and bge.doc_prefix == "" and bge.max_tokens == 8192
+
+    e5 = embedding_profile("intfloat/multilingual-e5-large")
+    assert e5 is not None and e5.doc_prefix == "passage: " and e5.query_prefix == "query: "
+
+    qwen = embedding_profile("Qwen/Qwen3-Embedding-0.6B-GGUF")
+    assert qwen is not None and qwen.doc_prefix == "" and "Query:" in qwen.query_prefix
+
+    assert embedding_profile("modello-sconosciuto") is None
