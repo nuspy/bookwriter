@@ -25,22 +25,26 @@ dependencies = [
     "numpy>=1.26",
     "scikit-learn>=1.4",
     "networkx>=3.2",
-    # Export (formati di default docx/pdf)
-    "pypandoc-binary>=1.13",
-    "reportlab>=4.0",
+    # Composizione ed export. Una sola catena per tutti i formati: il compositore di
+    # bookwriter.forge impagina PDF, DOCX ed EPUB dallo stesso modello di libro.
+    "reportlab>=4.0",      # impaginazione PDF
+    "python-docx>=1.1",    # DOCX con stili, indice vivo e titoli correnti
+    "pillow>=10.0",        # copertine
+    "pyyaml>=6.0",         # book.yaml
+    "pyphen>=0.14",        # sillabazione: senza, il giustificato apre fiumi di bianco
+    "pymupdf>=1.24",       # controlli di stampa e lettura dei PDF importati
+    # Ricerca sul web (fase 3) e lettura delle pagine trovate.
+    "beautifulsoup4>=4.12",
 ]
 
 [project.optional-dependencies]
-# Loader per formati aggiuntivi (pdf/docx/epub); importati in modo lazy.
-ingest = ["pymupdf>=1.24", "python-docx>=1.1", "ebooklib>=0.18", "beautifulsoup4>=4.12"]
+# Loader per formati aggiuntivi; importati in modo lazy.
+ingest = ["ebooklib>=0.18"]
 # Interfaccia grafica desktop.
 gui = ["pyside6>=6.6"]
 dev = ["pytest>=8.0", "pytest-httpx>=0.30", "ruff>=0.4"]
 # Installazione completa (runtime): loader + GUI.
-all = [
-    "pymupdf>=1.24", "python-docx>=1.1", "ebooklib>=0.18", "beautifulsoup4>=4.12",
-    "pyside6>=6.6",
-]
+all = ["ebooklib>=0.18", "pyside6>=6.6"]
 
 [project.scripts]
 bookwriter = "bookwriter.cli:app"
@@ -51,6 +55,9 @@ include = ["bookwriter*"]
 [tool.setuptools.package-data]
 # I cataloghi di traduzione dell'interfaccia viaggiano col pacchetto.
 "bookwriter.gui" = ["locales/*.json"]
+# Il metodo, i suoi riferimenti e i modelli di documento: li legge l'assistente durante le
+# sette fasi, quindi devono stare accanto al codice e non nel repository di partenza.
+"bookwriter.forge" = ["assets/*.md", "assets/templates/*", "assets/references/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -59,3 +66,6 @@ addopts = "-q"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Il compositore è codice di terze parti incorporato così com'è (vedi bookwriter/forge/bookgen):
+# riformattarlo renderebbe impossibile riallinearlo alla sorgente quando cambia.
+exclude = ["bookwriter/forge/bookgen"]

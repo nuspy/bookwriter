@@ -24,7 +24,7 @@ from bookwriter.layout.model import (
     DocumentLayout,
 )
 
-SUPPORTED_OUTPUTS = ("docx", "pdf", "md")
+SUPPORTED_OUTPUTS = ("docx", "pdf", "md", "epub")
 
 
 def layout_to_markdown(layout: DocumentLayout) -> str:
@@ -42,8 +42,13 @@ def layout_to_markdown(layout: DocumentLayout) -> str:
     return "\n".join(righe).rstrip() + "\n"
 
 
-def write_layout(layout: DocumentLayout, out_path: Path, fmt: str) -> Path:
-    """Scrive il libro nel formato richiesto conservandone la struttura."""
+def write_layout(layout: DocumentLayout, out_path: Path, fmt: str, **kwargs) -> Path:
+    """Scrive il libro nel formato richiesto conservandone la struttura.
+
+    L'EPUB fa eccezione, e non per pigrizia: un libro elettronico non ha pagine da conservare —
+    il carattere e la misura li sceglie chi legge. Lì la struttura si consegna al compositore,
+    che ne fa un volume rifluibile con indice e capitoli al posto giusto.
+    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "md":
@@ -52,6 +57,11 @@ def write_layout(layout: DocumentLayout, out_path: Path, fmt: str) -> Path:
         _write_docx(layout, out_path)
     elif fmt == "pdf":
         _write_pdf(layout, out_path)
+    elif fmt == "epub":
+        from bookwriter.forge.compose import compose_markdown
+
+        compose_markdown(layout_to_markdown(layout), out_path, "epub",
+                         title=layout.title or "", **kwargs)
     else:
         raise ValueError(f"Formato non supportato: {fmt} (usa {'|'.join(SUPPORTED_OUTPUTS)})")
     return out_path
@@ -61,15 +71,6 @@ def write_layout(layout: DocumentLayout, out_path: Path, fmt: str) -> Path:
 #  DOCX
 # --------------------------------------------------------------------------- #
 def _write_docx(layout: DocumentLayout, out_path: Path) -> None:
-    try:
-        import docx  # noqa: F401  (serve solo a sapere se la dipendenza c'è)
-    except ModuleNotFoundError:  # pragma: no cover - senza python-docx si passa da Pandoc
-        import pypandoc
-
-        pypandoc.convert_text(
-            layout_to_markdown(layout), "docx", format="markdown", outputfile=str(out_path)
-        )
-        return
     origine = Path(layout.source_path) if layout.source_path else None
     if layout.source_format == "docx" and origine and origine.exists():
         _docx_in_place(layout, origine, out_path)

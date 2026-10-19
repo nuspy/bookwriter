@@ -8,6 +8,12 @@ from typing import Any
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
 
+from bookwriter.llm.client import LLMCancelled
+
+#: Il messaggio con cui un lavoro interrotto dall'autore torna alla finestra.
+INTERROTTO = "Interrotto dall'autore."
+
+
 class WorkerSignals(QObject):
     finished = Signal(object)
     error = Signal(str)
@@ -43,6 +49,9 @@ class Worker(QRunnable):
                 result = self.fn(avanzamento)
             else:
                 result = self.fn()
+        except LLMCancelled:
+            # «Interrompi» ha chiuso la connessione: non è un guasto, e la GUI lo sa distinguere.
+            self._emit(self.signals.error, INTERROTTO)
         except Exception as exc:  # noqa: BLE001 - riportato alla GUI
             self._emit(self.signals.error, str(exc))
         else:

@@ -112,7 +112,8 @@ def test_compose_insists_until_the_chapter_reaches_its_budget(tmp_path: Path) ->
     rep = compose_outline(db, outline_id, "contratto", client, target_words=200, tolerance_pct=5)
     assert client.chiamate > 1  # ha riprovato
     assert rep.words >= 190  # è rientrato nel bersaglio
-    assert client.ultima_temperatura > 0  # la prosa non si scrive a temperatura zero
+    assert client.ultima_temperatura == 0.0, \
+        "il codice non impone nessuna temperatura (il fake riceve solo il suo default)"
 
 
 def test_compose_replaces_a_chapter_instead_of_duplicating_it(tmp_path: Path) -> None:

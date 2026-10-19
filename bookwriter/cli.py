@@ -62,12 +62,14 @@ session_app = typer.Typer(no_args_is_help=True, help="Sessioni e continuità (br
 style_app = typer.Typer(no_args_is_help=True, help="Profili di stile (estrai, definisci, autori, applica).")
 author_app = typer.Typer(no_args_is_help=True, help="Authoring interattivo: dal tema alla bozza.")
 outline_app = typer.Typer(no_args_is_help=True, help="Ispezione degli outline (struttura).")
+forge_app = typer.Typer(no_args_is_help=True, help="Le fasi: dal colloquio con l'autore al libro stampabile.")
 app.add_typer(project_app, name="project")
 app.add_typer(memory_app, name="memory")
 app.add_typer(session_app, name="session")
 app.add_typer(style_app, name="style")
 app.add_typer(author_app, name="author")
 app.add_typer(outline_app, name="outline")
+app.add_typer(forge_app, name="forge")
 
 console = Console()
 err = Console(stderr=True)
@@ -783,7 +785,10 @@ def compose(
     if coherence:
         coh = coherence_pass_compose(ppaths.db, outline_id, client, model=cfg.llm.models.quality)
         console.print(f"[green]✓[/green] coerenza: {coh['replacements']} sostituzioni, {len(coh['mappings'])} varianti uniformate")
-    out = write_output(compose_to_markdown(ppaths.db, outline_id), ppaths.exports / f"{slug}-book.{fmt}", fmt)
+    out = write_output(
+        compose_to_markdown(ppaths.db, outline_id), ppaths.exports / f"{slug}-book.{fmt}", fmt,
+        language=cfg.project.language or "it", production=cfg.production,
+    )
     console.print(f"[green]✓[/green] libro (prosa) esportato: {out}")
 
 
@@ -969,9 +974,915 @@ def author_draft(
     except (ValueError, LLMError) as exc:
         err.print(f"[red]Errore:[/red] {exc}")
         raise typer.Exit(code=1)
-    out = write_output(compose_to_markdown(ppaths.db, org.outline_id), ppaths.exports / f"{slug}-book.{fmt}", fmt)
+    out = write_output(
+        compose_to_markdown(ppaths.db, org.outline_id), ppaths.exports / f"{slug}-book.{fmt}", fmt,
+        language=cfg.project.language or "it", production=cfg.production,
+    )
     console.print(f"[green]✓[/green] {rep.summary()}")
     console.print(f"[green]✓[/green] bozza esportata: {out}")
+
+
+# --------------------------------------------------------------------------- #
+#  forge (le sette fasi: dal colloquio con l'autore al libro stampabile)
+# --------------------------------------------------------------------------- #
+def _forge(*, with_client: bool = True):
+    """Il libro del progetto attivo, pronto da lavorare."""
+    from bookwriter.forge import open_forge
+
+    pm = _pm()
+    slug, ppaths = _active_or_exit(pm)
+    cfg = pm.config_for(slug)
+    client = LMStudioClient(cfg.llm, cfg.embedding) if with_client else None
+    return open_forge(ppaths, cfg, client=client)
+
+
+def _forge_style(forge, style: str | None) -> str:
+    """Il contratto di stile: quello chiesto con ``--style``, altrimenti quello scelto per il
+    libro (anche dalla finestra), perché conversazione e stesura parlino dello stesso stile."""
+    pm = _pm()
+    _slug, ppaths = _active_or_exit(pm)
+    if style:
+        return build_style_contract(_load_style(ppaths, style))
+    if forge.state.style_id:
+        row = project_schema.get_style_row(ppaths.db, int(forge.state.style_id))
+        if row is not None:
+            return build_style_contract(StyleProfile.model_validate(row["data"]))
+    return ""
+
+
+@forge_app.command("init")
+def forge_init() -> None:
+    """Prepara la cartella del libro dentro il progetto attivo."""
+    forge = _forge(with_client=False)
+    forge.start()
+    console.print(f"[green]✓[/green] libro preparato in {forge.project.root}")
+    console.print("  MASTER_SPEC.md   la specifica contro cui lavorano tutte le fasi")
+    console.print("  chapters/        un file per capitolo, salvato appena è scritto")
+    console.print("  front/ back/     introduzione, avvertenza, glossario, biografia")
+    console.print("  research/        le fonti, con il livello di prova di ogni affermazione")
+    console.print("  output/          quello che produce la composizione")
+
+
+@forge_app.command("status")
+def forge_status() -> None:
+    """Cosa c'è davvero su disco, contro quello che la specifica prevede."""
+    forge = _forge(with_client=False)
+    stato = forge.status()
+    console.print(stato.render())
+    console.print()
+    for fase in forge.phases():
+        segno = {"fatta": "[green]✓[/green]", "in corso": "[yellow]›[/yellow]"}.get(fase.state, " ")
+        console.print(f" {segno} {fase.title:<22} {fase.detail}")
+    raise typer.Exit(code=3 if stato.missing or stato.unreadable else 0)
+
+
+@forge_app.command("interview")
+def forge_interview(
+    style: str = typer.Option(None, "--style", help="Profilo di stile scelto per il libro."),
+) -> None:
+    """Conversa con l'assistente sul libro: trama, personaggi, scopo, lettore.
+
+    Scrivi come parleresti a un editor: l'assistente domanda, propone e discute. Di stampa non
+    si parla — misura, copertina e formati si decidono con ``forge produce``.
+
+    Una riga vuota mette in pausa (quello che è stato detto resta, e riprendendo si continua da
+    lì); «/quaderno» mostra il quaderno del libro; «/fine» chiude la conversazione e lascia
+    decidere il resto all'assistente.
+    """
+    import sys
+
+    from bookwriter.forge import interview as iv
+    from bookwriter.forge import notebook as nb
+
+    forge = _forge()
+    forge.start()
+    contratto = _forge_style(forge, style)
+    if forge.state.transcript:
+        ultima = forge.state.transcript[-1]
+        console.print(f"[dim]… si riprende da: {ultima.get('text', '')[:300]}[/dim]")
+    else:
+        console.print(iv.OPENING, markup=False)
+    console.print("[dim]Quando hai finito scrivi /fine: chiude la conversazione e lascia "
+                  "decidere il resto all'assistente.[/dim]")
+
+    def scrivi(tipo: str, pezzo: str) -> None:
+        # Il testo del modello va stampato così com'è: per rich una parentesi quadra è markup.
+        if tipo == "content":
+            sys.stdout.write(pezzo)
+            sys.stdout.flush()
+
+    def chiudi() -> None:
+        try:
+            console.print(forge.finish_interview(style_contract=contratto), markup=False)
+        except (LLMError, ValueError) as exc:
+            err.print(f"[red]Errore:[/red] {exc}")
+            raise typer.Exit(code=1)
+        console.print()
+        console.print(nb.render(forge.state.notebook), markup=False)
+
+    while True:
+        console.print()
+        testo = typer.prompt("Tu", default="", show_default=False).strip()
+        if not testo:
+            console.print("[yellow]In pausa.[/yellow] Quello che hai detto è salvato.")
+            break
+        if testo == "/quaderno":
+            console.print(nb.render(forge.state.notebook) or "(il quaderno è ancora vuoto)",
+                          markup=False)
+            continue
+        if testo == "/fine":
+            chiudi()
+            break
+        console.print()
+        try:
+            forge.talk(testo, style_contract=contratto, on_delta=scrivi)
+        except LLMError as exc:
+            err.print(f"\n[red]La risposta non è arrivata:[/red] {exc}")
+            continue
+        console.print()
+        try:
+            esito = forge.update_notebook()
+        except (LLMError, ValueError) as exc:
+            console.print(f"[dim]Il quaderno non si è aggiornato ({exc}): riprovo al prossimo "
+                          "scambio.[/dim]")
+            continue
+        if esito.close_requested and not forge.state.interview_closed:
+            # Come /fine: l'autore l'ha chiesto a parole, e la conversazione non avvia niente.
+            console.print("[dim]Hai chiesto di cominciare: chiudo la conversazione.[/dim]")
+            chiudi()
+            break
+
+
+@forge_app.command("finish")
+def forge_finish(
+    style: str = typer.Option(None, "--style", help="Profilo di stile scelto per il libro."),
+) -> None:
+    """Chiude la conversazione: l'assistente completa il quaderno e dice cosa ha deciso."""
+    from bookwriter.forge import notebook as nb
+
+    forge = _forge()
+    try:
+        console.print(forge.finish_interview(style_contract=_forge_style(forge, style)),
+                      markup=False)
+    except (LLMError, ValueError) as exc:
+        err.print(f"[red]Errore:[/red] {exc}")
+        raise typer.Exit(code=1)
+    console.print()
+    console.print(nb.render(forge.state.notebook), markup=False)
+
+
+@forge_app.command("spec")
+def forge_spec(
+    chapters: int = typer.Option(0, "--chapters", help="Quanti capitoli; 0 = decide l'assistente."),
+    approve: bool = typer.Option(False, "--approve", help="Approva subito, senza rileggerla."),
+    style: str = typer.Option(None, "--style", help="Profilo di stile scelto per il libro."),
+) -> None:
+    """Propone la struttura e scrive ``MASTER_SPEC.md``."""
+    forge = _forge()
+    try:
+        testo = forge.make_spec(chapters=chapters or None,
+                                style_contract=_forge_style(forge, style))
+    except (LLMError, ValueError) as exc:
+        err.print(f"[red]Errore:[/red] {exc}")
+        raise typer.Exit(code=1)
+    console.print(testo)
+    console.print(f"\n[green]✓[/green] scritta: {forge.project.spec_path}")
+    if approve:
+        forge.approve_spec()
+        console.print("[green]✓[/green] approvata.")
+    else:
+        console.print("Rileggila e poi `bookwriter forge approve`. Rivedere una struttura costa "
+                      "minuti, rivedere venti capitoli costa giorni.")
+
+
+@forge_app.command("approve")
+def forge_approve() -> None:
+    """Approva la specifica: da qui in poi si scrive contro quel documento."""
+    forge = _forge(with_client=False)
+    if not forge.project.spec_path.exists():
+        err.print("[red]La specifica non è stata scritta.[/red] Esegui prima `forge spec`.")
+        raise typer.Exit(code=1)
+    forge.approve_spec()
+    console.print("[green]✓[/green] specifica approvata.")
+
+
+research_app = typer.Typer(
+    no_args_is_help=False,
+    invoke_without_command=True,
+    help="Ricerca: prima il panorama, poi le fonti dei capitoli.",
+)
+blocked_app = typer.Typer(
+    no_args_is_help=True,
+    help="Gestione delle pagine bloccate e della coda su cartella.",
+)
+
+
+@research_app.callback(invoke_without_command=True)
+def forge_research(
+    ctx: typer.Context,
+    landscape: bool = typer.Option(True, "--landscape/--no-landscape",
+                                   help="Guarda i libri che esistono già."),
+    chapters: bool = typer.Option(False, "--chapters", help="Cerca le fonti di ogni capitolo."),
+    decline: bool = typer.Option(False, "--decline", help="Rinuncia alla ricerca e vai avanti."),
+    redo: bool = typer.Option(False, "--redo",
+                              help="Rifà panorama e punti di tutti i capitoli, tenendo il "
+                                   "materiale già raccolto e le tue decisioni."),
+    fresh: bool = typer.Option(False, "--fresh",
+                               help="Mette da parte tutto il materiale (research/.superati/) e "
+                                    "ricomincia da zero."),
+) -> None:
+    """Ricerca: prima il panorama (che cambia la struttura), poi le fonti dei capitoli.
+
+    Senza --redo né --fresh **riprende** da dove si era arrivati: il panorama c'è già e i
+    capitoli e i punti fatti non si rifanno.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+
+    forge = _forge()
+    if decline:
+        console.print(forge.decline_research())
+        return
+    if redo and fresh:
+        err.print("[red]--redo e --fresh si escludono: scegline uno.[/red]")
+        raise typer.Exit(code=2)
+    if fresh:
+        console.print(f"Messo da parte in: {forge.set_aside_research() or '(niente da mettere da parte)'}")
+    elif redo:
+        console.print(f"Punti azzerati in {forge.prepare_redo()} capitoli (il materiale resta).")
+    from bookwriter.forge.research import ResearchFailed
+
+    try:
+        if landscape and (redo or fresh or forge.landscape_data() is None):
+            report = forge.research_landscape()
+            console.print(report.summary())
+        if chapters:
+            from bookwriter.forge.research import describe_note
+
+            for rapporto in forge.research_chapters(
+                    note=lambda n: console.print(f"  {describe_note(n)}")):
+                console.print(rapporto.summary())
+    except ResearchFailed as exc:
+        # Una ricerca a buchi non è fatta: lo si dice in chiaro e si esce con errore, invece di
+        # lasciare una traccia di eccezione che non spiega cosa fare.
+        from rich.markup import escape
+
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from exc
+
+
+@blocked_app.command("list")
+def forge_blocked_list() -> None:
+    """Le pagine in coda con motivo e stato."""
+    from rich.table import Table
+
+    forge = _forge(with_client=False)
+    pagine = forge.blocked_pages()
+    if not pagine:
+        console.print("Nessuna pagina bloccata registrata.")
+        return
+
+    table = Table(title="Pagine bloccate (coda.jsonl)")
+    table.add_column("ID", style="cyan")
+    table.add_column("Capitolo", justify="right")
+    table.add_column("Punto", justify="right")
+    table.add_column("Motivo", style="yellow")
+    table.add_column("Stato", style="bold")
+    table.add_column("Indirizzo", style="blue")
+
+    for p in pagine:
+        table.add_row(
+            p.id,
+            str(p.chapter),
+            str(p.point),
+            p.reason,
+            p.status,
+            p.url,
+        )
+    console.print(table)
+
+
+@blocked_app.command("export")
+def forge_blocked_export() -> None:
+    """Riscrive research/bloccate/coda.jsonl."""
+    from bookwriter.forge import blocked
+
+    forge = _forge(with_client=False)
+    pagine = forge.blocked_pages()
+    blocked.save_coda(forge.project.research_dir, pagine)
+    coda_p = blocked.coda_file(forge.project.research_dir)
+    console.print(f"[green]✓[/green] Riscritte {len(pagine)} righe in {coda_p}.")
+
+
+@blocked_app.command("import")
+def forge_blocked_import() -> None:
+    """Importa ciò che c'è in research/bloccate/ricevute/."""
+    forge = _forge(with_client=True)
+    esiti = forge.import_blocked_pages()
+    if not esiti:
+        console.print("Nessun file trovato da importare in research/bloccate/ricevute/.")
+        return
+
+    importati = sum(1 for e in esiti if e.get("status") == "ok")
+    non_ric = sum(1 for e in esiti if e.get("status") == "non_riconosciuta")
+    non_leg = sum(1 for e in esiti if e.get("status") in ("non_leggibile", "vuoto"))
+
+    for e in esiti:
+        st = e.get("status")
+        f = e.get("file")
+        if st == "ok":
+            console.print(f"[green]✓[/green] {f} importato con successo.")
+        elif st in ("non_leggibile", "vuoto"):
+            console.print(f"[yellow]⚠[/yellow] {f} non leggibile: {e.get('detail', '')}")
+        else:
+            console.print(f"[red]✗[/red] {f} non riconosciuto: {e.get('detail', '')}")
+
+    console.print(f"\nRiepilogo: {importati} importati, {non_leg} non leggibili, {non_ric} non riconosciuti.")
+
+
+@blocked_app.command("fetch")
+def forge_blocked_fetch() -> None:
+    """Chiede al servizio esterno (/v1) le pagine in coda e le importa."""
+    forge = _forge(with_client=True)
+    try:
+        esito = forge.fetch_blocked_pages(
+            progress=lambda fatte, tot: console.print(f"  {fatte} di {tot}") if tot else None)
+    except RuntimeError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    if not esito["total"]:
+        console.print("Nessuna pagina in coda da recuperare.")
+        return
+    if not esito["service_ready"]:
+        err.print("[yellow]Il servizio esterno non risulta pronto: provo lo stesso.[/yellow]")
+    ancora = ", ".join(f"{n} {m}" for m, n in esito["still_blocked"].items()) or "0"
+    console.print(
+        f"Recuperate {esito['fetched']} di {esito['total']}. Ancora bloccate: {ancora}. "
+        f"Non pertinenti: {esito['irrelevant']}. Senza risposta dal servizio: "
+        f"{esito['no_answer']}. Già in ricevute/: {esito['skipped']}."
+        + (" Interrotto." if esito["stopped"] else ""))
+
+
+@forge_app.command("update-trawl")
+def forge_update_trawl() -> None:
+    """Aggiorna il microservizio TRAWL dal repository originale GitHub."""
+    from bookwriter.forge import browser_service
+
+    console.print("[cyan]==>[/cyan] Aggiornamento di TRAWL in corso...")
+    try:
+        res = browser_service.update_trawl()
+        commit = res.get("commit") or "sconosciuto"
+        date = res.get("date") or ""
+        path = res.get("path") or ""
+        console.print("[green]✓[/green] TRAWL aggiornato con successo!")
+        console.print(f"  Commit: [bold]{commit}[/bold] ({date})")
+        console.print(f"  Percorso: [dim]{path}[/dim]")
+    except Exception as exc:
+        err.print(f"[red]Errore durante l'aggiornamento di TRAWL:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+blocked_app.command("update-trawl")(forge_update_trawl)
+
+
+@forge_app.command("start-trawl")
+def forge_start_trawl(
+    port: int = typer.Option(8191, "--port", "-p", help="Porta su cui avviare TRAWL (default 8191)."),
+) -> None:
+    """Avvia il microservizio TRAWL in modalità standalone."""
+    import os
+    import subprocess
+    from bookwriter.forge import browser_service
+
+    bun_exe = browser_service.find_bun()
+    if not bun_exe:
+        err.print("[red]Bun non trovato.[/red] Installalo con 'winget install Oven-sh.Bun' o da https://bun.sh")
+        raise typer.Exit(code=1)
+
+    t_dir = browser_service.trawl_dir()
+    api_dir = t_dir / "apps" / "api"
+    entry = api_dir / "src" / "index.ts"
+    if not entry.exists():
+        err.print(f"[red]TRAWL non trovato in {t_dir}.[/red] Esegui prima `forge update-trawl`.")
+        raise typer.Exit(code=1)
+
+    console.print(f"[cyan]==>[/cyan] Avvio di TRAWL in modalità standalone su [bold]http://127.0.0.1:{port}[/bold]...")
+    console.print("[dim]Premi Ctrl+C per arrestarlo.[/dim]")
+
+    env = os.environ.copy()
+    env["PORT"] = str(port)
+    env["SESSION_CACHE_DRIVER"] = "memory"
+    env["BROWSER_POOL_SIZE"] = "1"
+    env["BROWSER_HEADFUL_POOL_SIZE"] = "0"
+    env["SCRAPE_MIN_TIER"] = "1"
+    env["MCP_ENABLED"] = "false"
+    env["MITM_ENABLED"] = "false"
+
+    try:
+        subprocess.run([bun_exe, "--cwd", str(api_dir), "src/index.ts"], cwd=str(t_dir), env=env)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]TRAWL arrestato.[/yellow]")
+
+
+blocked_app.command("start-trawl")(forge_start_trawl)
+
+
+research_app.add_typer(blocked_app, name="blocked")
+forge_app.add_typer(research_app, name="research")
+forge_app.add_typer(blocked_app, name="blocked")
+
+
+
+@forge_app.command("questions")
+def forge_questions(
+    decide: str = typer.Option(None, "--decide", help="L'id della questione su cui decidere."),
+    omit: bool = typer.Option(False, "--omit", help="Con --decide: tralascia l'informazione."),
+    publish: str = typer.Option(None, "--publish",
+                                help="Con --decide: pubblica con questa formulazione."),
+    discard: str = typer.Option(None, "--discard",
+                                help="Scarta questa questione (non si cancella: si ripristina "
+                                     "con --restore)."),
+    restore: str = typer.Option(None, "--restore", help="Ripristina una questione scartata."),
+    discard_old: bool = typer.Option(False, "--discard-old",
+                                     help="Scarta tutte le questioni vecchie ancora aperte."),
+    resume: bool = typer.Option(False, "--resume",
+                                help="Riprende l'approfondimento delle questioni rimaste ferme."),
+    source: str = typer.Option(None, "--source",
+                               help="Con --decide: un indirizzo o un file (pdf, docx, md, txt) "
+                                    "che documenta la questione."),
+) -> None:
+    """I contrasti segnalati dalla ricerca (fatti che sembrano comprovati), con il loro stato.
+
+    La conversazione con l'assistente sta nella finestra; da qui basta poter vedere e decidere.
+    """
+    from pathlib import Path
+
+    from bookwriter.forge import research_store as store
+
+    forge = _forge(with_client=source is not None or resume)
+    if discard_old:
+        console.print(f"{forge.discard_old_questions()} questioni vecchie scartate.")
+        return
+    if discard or restore:
+        try:
+            q = forge.discard_question(discard or restore, on=bool(discard))
+        except ValueError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=2) from exc
+        console.print(f"{q.id}: {'scartata' if q.discarded else 'ripristinata'}.")
+        return
+    if resume:
+        try:
+            console.print(f"{forge.resume_deepening()} questioni riprese.")
+        except RuntimeError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=2) from exc
+        return
+    if decide is None:
+        domande = forge.questions()
+        if not domande:
+            console.print("Nessun contrasto segnalato: nel libro resta tutto com'è scritto.")
+            return
+        for q in domande:
+            esito = q.outcome or {}
+            dettaglio = {"source": f" → fonte: {esito.get('source', '')}",
+                         "publish": f" → pubblica così: {esito.get('text', '')}",
+                         "omit": " → tralascia"}.get(esito.get("kind", ""), "")
+            sc = " (scartata)" if q.discarded else ""
+            console.print(f"[bold]{q.id}[/bold] [{q.status}]{sc} cap. {q.chapter}: "
+                          f"{q.text}{dettaglio}")
+        console.print(f"\n{len(forge.pending_questions())} da decidere.")
+        return
+    try:
+        if source is not None:
+            percorso = Path(source)
+            testo, files = ("", [percorso]) if percorso.exists() else (source, [])
+            risolte, materiale = forge.resolve_with_material(testo, files)
+            for nota in materiale.notes:
+                err.print(f"[yellow]{nota}[/yellow]")
+            if not any(q.id == decide for q in risolte):
+                err.print("[red]Il materiale non risolve questa questione.[/red]")
+                raise typer.Exit(code=1)
+            console.print(f"[green]✓[/green] {decide} risolta.")
+        elif omit:
+            forge.decide_question(decide, store.OUT_OMIT)
+            console.print(f"[green]✓[/green] {decide}: tralasciata.")
+        elif publish:
+            forge.decide_question(decide, store.OUT_PUBLISH, publish)
+            console.print(f"[green]✓[/green] {decide}: si pubblica così.")
+        else:
+            err.print("[red]Con --decide serve --omit, --publish \"testo\" o --source.[/red]")
+            raise typer.Exit(code=2)
+    except ValueError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2)
+
+
+review_app = typer.Typer(
+    no_args_is_help=True,
+    help="La revisione dei risultati della ricerca con l'autore, un punto alla volta (facoltativa).")
+forge_app.add_typer(review_app, name="review")
+
+
+def _review_point_line(p) -> str:
+    stato = {"aperto": "aperto", "in_discussione": "in discussione", "concordato": "concordato",
+             "imposto": "imposto dall'autore", "fonte": "fonte", "tralasciato": "tralasciato",
+             "rimandato": "rimandato", "obsoleto": "obsoleto"}.get(p.status, p.status)
+    cap = f" cap. {p.chapter}" if p.chapter else ""
+    return f"[bold]{p.id}[/bold] [{stato}] ({p.kind}{cap}) {p.title}"
+
+
+@review_app.command("generate")
+def review_generate() -> None:
+    """Prepara l'elenco dei punti da discutere (rifarlo non perde le decisioni già prese)."""
+    from bookwriter.forge.review import ReviewFailed
+
+    forge = _forge()
+    try:
+        dati = forge.review_generate(note=lambda n: err.print(f"[yellow]{n}[/yellow]"))
+    except (ReviewFailed, LLMError, RuntimeError) as exc:
+        from rich.markup import escape
+
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"{len(dati.points)} punti. Usa `forge review list`.")
+    for w in dati.warnings:
+        err.print(f"[yellow]{w}[/yellow]")
+
+
+@review_app.command("list")
+def review_list() -> None:
+    """I punti, nell'ordine in cui si propongono, con il loro stato."""
+    forge = _forge(with_client=False)
+    dati = forge.review_data()
+    if dati is None or not dati.points:
+        console.print("Nessun punto: la revisione non è stata preparata (`forge review generate`).")
+        return
+    for p in dati.points:
+        console.print(_review_point_line(p))
+    console.print(f"\n{len(dati.pending())} ancora da decidere.")
+
+
+@review_app.command("show")
+def review_show(point_id: str = typer.Argument(..., help="L'id del punto, es. r001.")) -> None:
+    """Un punto per intero: cosa dice il libro, le prove, la conversazione, la decisione."""
+    from bookwriter.forge import review as rv
+
+    forge = _forge(with_client=False)
+    dati = forge.review_data()
+    punto = dati.point(point_id) if dati else None
+    if punto is None:
+        err.print(f"[red]Non c'è nessun punto {point_id}.[/red]")
+        raise typer.Exit(code=2)
+    console.print(_review_point_line(punto))
+    console.print(rv.opening(punto), markup=False)
+    for b in punto.thread[1:]:
+        ruolo = {"assistant": "Assistente", "user": "Autore", "notice": "·"}.get(b.get("role"), "?")
+        console.print(f"\n{ruolo}: {b.get('text', '')}", markup=False)
+    if punto.decision:
+        d = punto.decision
+        console.print(f"\nDecisione ({d.kind}): {d.text or 'tralascia'}", markup=False)
+
+
+@review_app.command("talk")
+def review_talk(
+    point_id: str = typer.Argument(..., help="L'id del punto."),
+    text: str = typer.Argument(..., help="Cosa dici all'assistente."),
+) -> None:
+    """Una battuta sul punto: stampa la risposta e la decisione che l'app registrerebbe."""
+    forge = _forge()
+    try:
+        risposta, log, note = forge.review_talk(point_id, text)
+        proposta = forge.review_propose(point_id)
+    except (ValueError, LLMError, RuntimeError) as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    for s_ in log:
+        console.print(f"· {s_.summary()}", markup=False)
+    for n in note:
+        err.print(f"[yellow]{n}[/yellow]")
+    console.print(risposta, markup=False)
+    if proposta:
+        console.print(f"\nRegistrerei ({proposta['kind']}): {proposta['text'] or 'tralascia'}\n"
+                      f"Per confermare: `forge review confirm {point_id} --kind "
+                      f"{proposta['kind']} --text \"…\"`", markup=False)
+
+
+@review_app.command("confirm")
+def review_confirm(
+    point_id: str = typer.Argument(..., help="L'id del punto."),
+    kind: str = typer.Option(..., "--kind", help="concordata, imposta, fonte o tralascia."),
+    text: str = typer.Option("", "--text", help="La formulazione da usare nel libro."),
+    note: str = typer.Option("", "--note", help="Note per gli appunti (prove contrarie…)."),
+    keep_note: bool = typer.Option(False, "--keep-note/--no-keep-note",
+                                   help="Metti le note negli appunti (review_notes.md)."),
+    source: str = typer.Option("", "--source", help="Per `fonte`: la fonte."),
+    url: str = typer.Option("", "--url", help="Per `fonte`: l'indirizzo."),
+) -> None:
+    """Registra la decisione dell'autore su un punto (l'unico comando che la scrive)."""
+    forge = _forge(with_client=False)
+    try:
+        p = forge.review_confirm(point_id, kind, text, note=note, keep_note=keep_note,
+                                 source=source, url=url, by_author=True)
+    except ValueError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    console.print(f"[green]✓[/green] {p.id}: {p.status}.")
+
+
+@review_app.command("skip")
+def review_skip(
+    point_id: str = typer.Argument(None, help="Il punto da saltare; senza, vedi --all."),
+    all_points: bool = typer.Option(False, "--all", help="Salta la revisione intera."),
+) -> None:
+    """Salta un punto (o tutta la revisione): resta da decidere, senza nessun effetto sul libro."""
+    forge = _forge(with_client=False)
+    try:
+        if all_points:
+            console.print(f"{forge.review_skip_all()} punti rimandati.")
+        elif point_id:
+            forge.review_skip_point(point_id)
+            console.print(f"{point_id}: rimandato.")
+        else:
+            err.print("[red]Serve l'id di un punto, oppure --all.[/red]")
+            raise typer.Exit(code=2)
+    except ValueError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
+@review_app.command("free")
+def review_free(text: str = typer.Argument(..., help="Cosa dici all'assistente.")) -> None:
+    """La chat libera di fine revisione, con le perplessità dell'app."""
+    forge = _forge()
+    try:
+        risposta, log, note = forge.review_free_talk(text)
+    except (ValueError, LLMError, RuntimeError) as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    for s_ in log:
+        console.print(f"· {s_.summary()}", markup=False)
+    for n in note:
+        err.print(f"[yellow]{n}[/yellow]")
+    console.print(risposta, markup=False)
+
+
+@review_app.command("perplexities")
+def review_perplexities() -> None:
+    """Le perplessità dell'app prima di scrivere (fatti verificabili, nessun giudizio)."""
+    forge = _forge(with_client=False)
+    cose = forge.review_perplexities()
+    for c in cose:
+        console.print(f"- {c}", markup=False)
+    if not cose:
+        console.print("Nessuna perplessità.")
+
+
+@forge_app.command("write")
+def forge_write(
+    all_chapters: bool = typer.Option(False, "--all", help="Scrivi tutti i capitoli che mancano."),
+    style: str = typer.Option(None, "--style", help="Profilo di stile da applicare."),
+    redo_short: bool = typer.Option(
+        False, "--redo-short",
+        help="Rifà i capitoli sotto il 60% del loro budget di parole: quelli di prima si mettono "
+             "da parte in chapters/.superati/, non si cancellano."),
+) -> None:
+    """Scrive i capitoli. Ognuno finisce su disco appena è pronto, prima del successivo."""
+    forge = _forge()
+    contratto = _forge_style(forge, style)
+
+    def racconta(n) -> None:
+        if isinstance(n, tuple) and n and n[0] == "section":
+            console.print(f"  capitolo {n[1]}: sezione {n[2]} di {n[3]}")
+        else:
+            console.print(f"  {n}")
+
+    try:
+        if redo_short:
+            corti = forge.short_chapters()
+            if not corti:
+                console.print("Nessun capitolo è molto sotto il suo budget di parole.")
+                return
+            for numero, parole, budget in corti:
+                console.print(f"  capitolo {numero}: {parole} parole su {budget}")
+            messi, report = forge.redo_short_chapters(style_contract=contratto, note=racconta)
+            for percorso in messi:
+                console.print(f"  messo da parte: {percorso}")
+            console.print(report.summary())
+        elif all_chapters:
+            report = forge.write_all(style_contract=contratto, note=racconta)
+            console.print(report.summary())
+        else:
+            risultato = forge.write_next(style_contract=contratto, note=racconta)
+            if risultato is None:
+                console.print("Tutti i capitoli previsti sono già su disco.")
+            else:
+                console.print(f"[green]✓[/green] {risultato.line()} → {risultato.path}")
+    except (LLMError, ValueError) as exc:
+        err.print(f"[red]Errore:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
+@forge_app.command("matter")
+def forge_matter(
+    kind: str = typer.Argument(..., help="introduzione|prefazione|avvertenza|glossario|"
+                                         "biografia|ringraziamenti"),
+    style: str = typer.Option(None, "--style", help="Profilo di stile da applicare."),
+) -> None:
+    """Scrive una pagina iniziale o finale."""
+    forge = _forge()
+    try:
+        path = forge.write_matter(kind, style_contract=_forge_style(forge, style))
+    except (ValueError, LLMError) as exc:
+        err.print(f"[red]Errore:[/red] {exc}")
+        raise typer.Exit(code=1)
+    console.print(f"[green]✓[/green] scritta: {path}")
+
+
+@forge_app.command("produce")
+def forge_produce(
+    trim: str = typer.Option(None, "--trim", help="a5|b-format|5x8|5.5x8.5|6x9|7x10|a4."),
+    cover: Path = typer.Option(None, "--cover", help="L'immagine di copertina, che fornisce l'autore."),
+) -> None:
+    """Scrive ``book.yaml`` e controlla la copertina contro la misura scelta."""
+    forge = _forge(with_client=False)
+    if trim:
+        forge.cfg.production.trim = trim
+    path = forge.produce()
+    console.print(f"[green]✓[/green] scritto: {path}")
+    if cover:
+        try:
+            forge.set_cover(cover)
+        except FileNotFoundError as exc:
+            err.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=2)
+    console.print(forge.cover_check().message())
+
+
+@forge_app.command("build")
+def forge_build(
+    only: str = typer.Option(None, "--only", help="pdf,docx,epub,md — separati da virgola."),
+    without_cover: bool = typer.Option(
+        False, "--without-cover",
+        help="Oltre alla versione con copertina, anche una copia senza copertina per ogni "
+             "formato che ne porta una (PDF interno, EPUB)."),
+    allow_missing_cover: bool = typer.Option(
+        False, "--allow-missing-cover",
+        help="Non ha più effetto: senza copertina si esporta comunque, con un'avvertenza. "
+             "Accettata per compatibilità."),
+) -> None:
+    """Compone ed esporta, poi esegue i controlli di stampa."""
+    from bookwriter.forge.build import BuildError, CoverMissing
+
+    forge = _forge(with_client=False)
+    formati = [f.strip().lower() for f in only.split(",")] if only else None
+    try:
+        report = forge.build(formats=formati, copy_without_cover=without_cover,
+                             note=lambda n: console.print(f"  {n}"))
+    except CoverMissing as exc:
+        err.print(f"[red]Manca la copertina:[/red] {exc}")
+        raise typer.Exit(code=2)
+    except BuildError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(report.summary())
+    raise typer.Exit(code=0 if report.check_ok else 3)
+
+
+@forge_app.command("check")
+def forge_check() -> None:
+    """Rifà i controlli sui file già prodotti. Si riporta tutto: errori e avvertenze."""
+    forge = _forge(with_client=False)
+    testo, ok = forge.check()
+    console.print(testo)
+    console.print("\nQuesti controlli non sostituiscono Kindle Previewer 3 per l'ebook né una "
+                  "copia stampata per la carta.")
+    raise typer.Exit(code=0 if ok else 3)
+
+
+@forge_app.command("notes")
+def forge_notes() -> None:
+    """Scrive ``output/PRODUCTION_NOTES.md``: cosa è fatto e cosa resta aperto."""
+    forge = _forge(with_client=False)
+    path = forge.handover()
+    console.print(f"[green]✓[/green] scritte: {path}")
+    console.print(path.read_text(encoding="utf-8"))
+
+
+@forge_app.command("save")
+def forge_save(
+    name: str = typer.Argument("", help="Come chiamare il salvataggio."),
+) -> None:
+    """Mette da parte il libro com'è adesso, in un file solo. Il lavoro non si interrompe."""
+    from bookwriter.forge import saves as sv
+
+    pm = _pm()
+    _slug, ppaths = _active_or_exit(pm)
+    forge = _forge(with_client=False)
+    try:
+        info = sv.save_work(forge.project, ppaths.saves, name)
+    except sv.SaveError as exc:
+        from rich.markup import escape
+
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]✓[/green] {info.label()}")
+    console.print(f"  {info.path}")
+
+
+@forge_app.command("saves")
+def forge_saves() -> None:
+    """Elenca i libri messi da parte, dal più recente."""
+    from bookwriter.forge import saves as sv
+
+    pm = _pm()
+    _slug, ppaths = _active_or_exit(pm)
+    elenco = sv.list_saves(ppaths.saves)
+    if not elenco:
+        console.print("[dim]Nessun salvataggio. Mettine da parte uno con `bookwriter forge save`.[/dim]")
+        return
+    for indice, info in enumerate(elenco, 1):
+        console.print(f" {indice:>2}. {info.label()}")
+        console.print(f"     [dim]{info.path.name}[/dim]")
+
+
+@forge_app.command("restore")
+def forge_restore(
+    which: str = typer.Argument(..., help="Numero nell'elenco di `forge saves`, o nome del file."),
+) -> None:
+    """Rimette in lavorazione un salvataggio. Quello di adesso viene messo da parte prima."""
+    from bookwriter.forge import saves as sv
+
+    pm = _pm()
+    _slug, ppaths = _active_or_exit(pm)
+    forge = _forge(with_client=False)
+    elenco = sv.list_saves(ppaths.saves)
+    scelto = None
+    if which.isdigit() and 1 <= int(which) <= len(elenco):
+        scelto = elenco[int(which) - 1].path
+    else:
+        scelto = next((s.path for s in elenco if which in s.path.name or which == s.name), None)
+    if scelto is None:
+        err.print(f"[red]Nessun salvataggio corrisponde a «{which}». Vedi `bookwriter forge saves`.[/red]")
+        raise typer.Exit(code=1)
+    try:
+        info = sv.restore_save(scelto, forge.project, backup_dir=ppaths.saves)
+    except sv.SaveError as exc:
+        from rich.markup import escape
+
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]✓[/green] ripreso: {info.label()}")
+    console.print("  Quello che stava in lavorazione è stato messo da parte: `bookwriter forge saves`.")
+
+
+@forge_app.command("reset")
+def forge_reset(
+    delete: bool = typer.Option(False, "--delete", help="Butta via il libro invece di salvarlo."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Non chiedere conferma."),
+) -> None:
+    """Azzera le sette fasi e riparte dall'intervista.
+
+    Senza ``--delete`` il libro di adesso viene messo da parte e resta ripescabile con
+    ``forge restore``: azzerare è una cosa che si fa spesso, perdere il lavoro no.
+    """
+    from bookwriter.forge import saves as sv
+
+    pm = _pm()
+    _slug, ppaths = _active_or_exit(pm)
+    forge = _forge(with_client=False)
+    if not sv.has_work(forge.project):
+        sv.clear_work(forge.project)
+        console.print("[green]✓[/green] si riparte dall'intervista: `bookwriter forge interview`")
+        return
+    stato = forge.status()
+    from bookwriter.forge.project import phase_title
+
+    console.print(f"Nel libro di adesso: {len(stato.written)} capitoli, "
+                  f"{sv._migliaia(stato.words)} parole, fase «{phase_title(forge.state.phase)}»")
+    if not yes:
+        domanda = ("Butto via tutto questo, senza possibilità di recuperarlo?" if delete
+                   else "Lo metto da parte e riparto dall'intervista?")
+        if not typer.confirm(domanda, default=not delete):
+            raise typer.Exit(code=1)
+    messo_da_parte = None
+    if not delete:
+        try:
+            messo_da_parte = sv.save_work(forge.project, ppaths.saves, stato.title)
+        except sv.SaveError as exc:
+            # La richiesta era «conservalo»: se non riesco, non cancello.
+            err.print(f"[red]Non l'ho messo da parte, quindi non l'ho cancellato: {exc}[/red]")
+            raise typer.Exit(code=1) from exc
+    try:
+        sv.clear_work(forge.project)
+    except sv.SaveError as exc:
+        from rich.markup import escape
+
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from exc
+    if messo_da_parte is not None:
+        console.print(f"[green]✓[/green] messo da parte: {messo_da_parte.path.name}")
+    console.print("Si riparte dall'intervista: `bookwriter forge interview`")
 
 
 # --------------------------------------------------------------------------- #

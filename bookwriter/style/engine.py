@@ -28,7 +28,7 @@ _DIMS_LIST = ", ".join(STYLE_DIMENSIONS)
 
 
 class SupportsLLM(Protocol):
-    def chat(self, messages: list[dict[str, str]], *, model: str | None = ..., max_tokens: int | None = ...) -> str:
+    def chat(self, messages: list[dict[str, str]], *, model: str | None = ...) -> str:
         ...
 
     def chat_json(self, messages: list[dict[str, str]], *, schema: dict, model: str | None = ...) -> Any:

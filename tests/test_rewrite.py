@@ -236,15 +236,15 @@ def test_a_correction_is_adopted_only_if_it_passes_the_same_check(tmp_path: Path
 def test_a_silent_critic_does_not_destroy_the_translation(tmp_path: Path) -> None:
     """Il controllo di stile è un di più: se non risponde, il lavoro va consegnato lo stesso.
 
-    Caso reale: un giudizio su 2.928 token ha prodotto 128.144 token di ragionamento in 26
-    minuti senza concludere, e faceva fallire l'intera traduzione già completata.
+    Caso reale: un giudizio su 2.928 token si è bloccato a ripetere la stessa sequenza, e
+    faceva fallire l'intera traduzione già completata.
     """
     from bookwriter.llm.client import LLMDegenerate
 
     class MuteCritic(FakeRewriteClient):
         def chat_json(self, messages, *, schema, model=None, reasoning_effort=""):
             if "conforms" in schema["properties"]:
-                raise LLMDegenerate("ha ragionato per 128 mila caratteri senza rispondere")
+                raise LLMDegenerate("si è bloccato a ripetere sempre la stessa sequenza")
             return super().chat_json(messages, schema=schema, model=model)
 
     db = tmp_path / "p.db"

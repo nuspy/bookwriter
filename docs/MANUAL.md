@@ -151,7 +151,12 @@ Open the **Settings** tab and set, in this order:
    slower. A cloud provider also shows the price per million tokens next to each model.
 5. **Model for the quality pass** is optional: a slower, more accurate model used only for style
    checks and consistency passes.
-6. Press **Save the settings**.
+6. **Reasoning** has two levels you choose: *extraction, conversation, writing* and *quick tasks*
+   (judging a web page's relevance, search queries, rewordings, the search intent in a chat). The
+   default is *the same as the other level* for both: the program changes nothing by itself. A
+   lower level for the quick tasks makes them much faster — one relevance judgement can cost
+   thousands of reasoning tokens.
+7. Press **Save the settings**.
 
 The search prefixes required by each embedding family are applied automatically when you pick the
 model. Changing the embedding model later is safe: the index is detected as stale and rebuilt.
@@ -321,7 +326,8 @@ consistent from beginning to end.
 - **Check the style** (on by default) asks the model after each block whether the result respects
   the style and redoes it if not. More faithful, roughly two and a half times slower. Turning it off
   halves the work.
-- **Format** — DOCX, PDF or Markdown. See §5.1: the layout of the original is kept in all three.
+- **Format** — DOCX, PDF, Markdown or EPUB. See §5.1: the layout of the original is kept in the
+  first three; an ebook has no pages to keep.
 - **Preview (first chapter)** runs on the first chapter only, so you can judge before committing.
 
 The work is resumable within the session: if a run is interrupted, the blocks already rewritten are
@@ -383,10 +389,224 @@ it came from is kept across restarts too (§4.4), so the interruption survives c
 
 ## 4.6 Write from scratch
 
-For a book you have not written yet. Three steps: describe the work (topic, audience, goal, target
-length); have the assistant generate ideas on sub-topics you name; then generate the full draft,
-which builds the graph, groups into chapters and writes the prose in one go — in the format you
-pick next to the style.
+For a book you have not written yet. You talk the book through with the assistant, and then it
+makes it, in eight phases (one of them optional). The strip of buttons at the top of the tab shows where you
+are; click one to move around, or use **Move to the next phase**, which tells you what is missing
+before it lets you past.
+
+**1 · Interview.** It is a conversation, not a questionnaire. Tell the assistant about the book
+the way you would tell an editor — an idea barely sketched is enough — and it works like one: it
+asks one thing at a time, tied to what you just said; it stretches the plot by asking what happens
+next and why; it points out the holes (an event with no cause, a character acting without a
+motive, an ending that contradicts the message); it proposes, and waits for your yes before
+treating anything as decided. Its territory is what you want the book to achieve and the effect
+it should have on the reader; who that reader is, and what follows for language, register and
+chapter length; the chain of events and the logical steps; the psychological mechanisms and the
+way facts connect; the scenes and passages you want, and the ending; the characters — how they
+look, how they think, their temperament and culture — and the places. It does **not** ask about
+printing, margins, cover, binding or channel, which you decide by hand in production; and it does
+not ask which style to use, because the style is the one chosen in the **Style** drop-down at the
+top right of the tab (it knows it, and at most suggests a refinement).
+
+Write in the box at the bottom: Enter sends, Shift+Enter starts a new line. The reply appears as
+it is written, and until it starts a line says how long the model has been thinking; **Stop**
+interrupts it, keeping what has already arrived. What you write while the assistant is busy is
+queued and sent as soon as it is free. If a reply does not arrive, what you wrote is saved and
+**Try again** sends it again.
+
+Beside the conversation, the **book notebook** grows after every exchange: plot, chain of events,
+how facts connect, characters, places, what the book wants to achieve, what was agreed together
+and what is still open. It is where you notice a misunderstanding while fixing it costs a
+sentence; the **Book notebook** button shows or hides it.
+
+You decide when the conversation is over. **I'm done: you decide the rest** closes it: the
+assistant completes the notebook, settles every open question and tells you, one line each, what
+it decided on its own. The conversation stays open — write again and the notebook follows. The
+notebook is what the following phases work from: the structure is designed on the chain of events
+and the key scenes, and each chapter is written knowing who the characters are and where the
+book is going.
+
+**2 · Specification.** **Propose the structure and write the specification** produces
+`MASTER_SPEC.md`: the notebook in order — the book, the reader, the plot, key scenes and ending,
+characters, the world — the chosen style, and a table with one line per chapter and its word
+budget. Read it, edit it if you like — by hand, with **Edit the
+specification…**, or in any text editor — and then **Approve**. Revising an outline costs minutes;
+revising twenty written chapters costs days. **Read the specification** (bottom left) shows it
+read-only in any phase, also after the approval; editing needs this phase.
+
+**3 · Research.** Research works *for* the book: it looks for material to write it better and for
+sources that support what you say — details, descriptions, first-hand experiences, how a place
+or an object in a scene really looks, quotations, ideas that expand your thesis and your story.
+Sources of any kind (academic, popular, forum posts, testimonies) are kept and labelled with
+their type; none is discarded for not being «authoritative». **See what already exists** looks
+for works similar to yours and writes `research/00_landscape.md`: for each one, what you can draw
+from it (ideas, images, scenes, cited sources) and a short note on where your book differs. It
+describes the field; it never says what your book must cover. **Find the chapters' sources**
+then gathers, point by point, the material each chapter can use, with a note on how it can
+serve, into one file per chapter.
+
+Checking facts is the last thing research does. It flags only a clash with a fact that seems
+established and would make a glaring mistake — and it shows it to you and discusses it; it
+never decides. What you invent — characters, names, plot, setting, chapter titles, your thesis
+and your style — is never checked. **What no source supports stays in the book exactly as you
+wrote it**; so does what the sources contradict, until *you* decide otherwise. Only a decision
+of yours leaves something out. The quality of what is read is guarded too: before a page goes to
+the model its main text is extracted (cookie banners, login walls, menus, footers, related links
+and ads are removed, and the count of what was removed is recorded), pages with nothing readable
+left are recorded as *unreadable*, and the model then judges, with one short call per clean page
+and in any language, whether the page serves the point (a video game that shares the chapter's
+name does not); pages below your threshold are recorded as *not relevant* with the model's
+one-line reason — if the judgement fails, the page stays. Unreadable and not-relevant pages
+remain visible in the research data and are never used. YouTube and Amazon are excluded by default
+(the result is recorded as *excluded* and nothing is downloaded); the list is in
+**Settings**, next to the web search, together with the two thresholds. A site that refuses the
+request (HTTP 403) is recorded with its code.
+
+**Resume, redo, start over.** The research saves after **every point**, so an interruption (or
+an error) loses at most the point that was half done. The status box always says what the program
+is doing and never reads *idle* while a job is running; when the research is unfinished it offers
+three buttons: **Resume the research** (the recommended one after an interruption: it continues
+from where it stopped, reusing everything saved, and redoes only the point left half done or
+failed), **Redo the research** (repeats the landscape and every point of every chapter *keeping
+what you already have* — pages read, results, claims, your decisions — and adds what is new; the
+landscape is rewritten; if you interrupt it, *Resume* carries the redo on) and **Delete and
+redo** (sets all the research material aside and starts from zero, without your decisions on the
+questions; it asks first, and nothing is deleted: the files go to `research/.superati/<date-time>/`).
+While one operation runs, starting another says which operation is running and offers to stop it.
+If the model server has too little free memory to answer (for instance Basalt's «RAM low»
+guard), that is not a failure of the point: the research **waits and retries the same request**
+(every 30 seconds, up to 30 minutes; both values are `resource_wait_s` and `resource_wait_max_s`
+in the `[llm]` section of `config.toml`), the status box says why it is waiting, and **Stop**
+ends the wait. The searches of a point use only the chapter, the point and a one-line context
+(title, form, setting) — never the themes of the other chapters. From the command line:
+`bookwriter forge research --chapters` resumes; add `--redo` or `--fresh`.
+
+**Blocked pages.** Pages that a site refuses to show (CAPTCHA, Cloudflare, HTTP 403…) are queued
+in `research/bloccate/` for an external tool you choose; bookwriter does not solve them itself. The
+formats, the settings and the commands are described in `docs/browser_integration.md`.
+
+**Quick judgements with Jev (optional).** Two judgements of the research are quick and cost the
+local model thousands of reasoning tokens each: *does this page serve the point?* and *which
+sections of a long page or PDF are the most useful?* **Jev** ([typesafe.ai](https://typesafe.ai)) answers
+them in about a quarter of a second. It is **off** by default.
+
+- **What leaves your computer.** Only *excerpts* — at most the number of characters set in
+  Settings (6,000 by default) per request, one section at a time — and the *point of the chapter*
+  being researched (chapter title and point, plus title, form and setting in one line). Never a
+  whole page, never a PDF, never the premise of the book, never your texts. Everything else
+  (extraction, writing, conversations) stays on the local model.
+- **How it is used.** (1) A page is judged on its cleaned excerpt: below the minimum score
+  (Jev's own scale, 0 off-topic, 1 barely related, 2 useful, 3 very useful; default 0.8) the page
+  is recorded as *not relevant* with the reason «Jev judgement 0.02, confidence 0.98». (2) A page
+  longer than what the local model reads for extraction (3,000 characters) is split into whole
+  sections; Jev scores each one, and the local model reads only the best sections, whole, in
+  document order, within that budget. A very long document has at most 60 sections scored.
+- **If Jev does not answer** (no network, error, timeout, unexpected reply) the local model
+  judges as it always did, and the page is kept when in doubt.
+- **Turning it on.** Settings → Research → *Quick judgements with Jev*, with your key in the
+  password field — or leave the field empty and set the `TYPESAFE_API_KEY` environment variable
+  (recommended: the key then lives in no file). The key is never printed in messages or logs.
+- **Cost and time.** Each chapter's research file (`NN_*.md` and `.json`) records the Jev calls,
+  the input tokens and the seconds spent, and how many times the local model had to take over.
+  Prices are TypeSafe's: check them on their site before leaving it on for a whole book.
+
+After the research you can **Discard** any single question, result or piece of material, or all
+the material of a chapter, and **Discard all the old questions** (those born before the research
+was reoriented). Discarding takes the element out of what the writing and the review read, but
+deletes nothing and can be undone (**Restore**). **Resume the deepening** picks up the questions
+left stalled after an interruption. If you would rather not do any of
+this, **Write without research** says once what that costs and moves on.
+
+This is the only part of the program that goes out to the internet, and it ships switched off.
+Turn it on in **Settings → Search the web too** and pick an engine: DuckDuckGo asks for nothing,
+Brave and Tavily want a key, SearXNG wants the address of your own instance. Left off, research
+works on the texts you imported into the project.
+
+**Review (optional, between research and writing).** The review puts in front of you, one point
+at a time, what research found, in this order: first the **material found**, ready to enter the
+book («I found this, and it can go into chapter 3»; the default is that it enters — you only
+decide how to use it, or to leave it out), including material from similar works; then **ideas to
+expand** your thesis and your story; then internal inconsistencies, and, last, the **clashes with
+established facts**, which are shown and discussed but never imposed. **Prepare the points to
+discuss** builds the list from the research data. Every point cites real evidence; a point
+without it is not proposed.
+
+The assistant talks each point through over as many exchanges as you like. It reports what the
+evidence says and what kind of source it is (A–E is a label, not a grade), says once if
+something clashes with what you write, and then accepts your decision: it never corrects your
+thesis. When you ask it to («look for references on…», «verify…», «find out how…») it searches
+the web, if you turned that on, and shows what it searched and read before replying. A decision
+is recorded only when you press **Confirm** on the card «I will record it like this», or when you
+write it yourself with **I decide…**: *agreed*, *I keep my position* (the book says it in your
+voice, even against the sources), *with this source*, or *leave out*. For each point you choose
+whether to keep the notes (contrary evidence, discarded wordings) in `research/review_notes.md`,
+a file the writing never reads; the box starts unticked. Decisions reach the writing with
+precedence over the research. A decision that would change the structure is only flagged.
+
+Everything can be skipped — a point (**Skip the point**), the whole phase (**Skip the review**) —
+and skipping **never leaves anything out**: undecided points stay open and the book stays as you
+wrote it. At the end the assistant lists its own doubts and offers a **free chat**. From the
+command line: `bookwriter forge review generate | list | show | talk | confirm | skip | free |
+perplexities`.
+
+**4 · Writing.** **Write the next chapter**, or **Write all the chapters** with the progress bar
+and the stop button. Each chapter is written to `<project>/book/chapters/NN_name.md` the moment it
+is done, before the next one starts — a book spans many working sessions, and what is not on disk
+when one ends is not recoverable by anyone. That is also why picking up again restarts from the
+first missing *file*, not from where anyone believes they got to. The same row writes the front
+and back matter: introduction, preface, notice, glossary, author biography, acknowledgements.
+
+A chapter the model fails on does not take the others down with it: the run carries on and the
+report names it at the end, with the reason, under **NON RIUSCITI**. Nothing was written for it,
+so pressing the button again simply picks it up along with whatever else is missing. Three
+failures in a row, though, stop the run — at that point it is not the chapter, it is the model or
+the server, and trying the remaining twenty would mean waiting out a full timeout on each to be
+told the same thing twenty times.
+
+**5 · Production.** **Choose the cover artwork…**: the cover comes from you, and is never invented
+nor generated unless you ask. The panel says whether the image holds up at the chosen size, and if
+it is too small it gives you the number — 1819×2551 pixels for A5 with bleed — instead of quietly
+enlarging it. Pick the **Page size**, then **Write book.yaml**, which collects into one file the title and
+language from the notebook and the object's decisions — size, imprint, author as printed,
+rights — from the project's production settings.
+
+**6 · Composition.** Tick the formats and press **Compose and export**. Out come a print PDF at
+the exact trim with the cover as page one, the interior on its own (which is what a printer and
+KDP actually want), the cover files, a DOCX with real styles and a live contents page, and an
+EPUB 3. Without artwork the build stops and asks for it; **even without a cover** composes the
+interior as a proof.
+
+**7 · Checks and handover.** The print checks run by themselves after every build: page count
+parity, page size against the declared trim, fonts not embedded, text too close to the trim,
+chapters landing on a left-hand page, EPUB structure, DOCX fields. **Write the production notes**
+puts in `output/PRODUCTION_NOTES.md` what is still open — ISBN, font licensing for a commercial
+run, spine width, back cover copy — and says plainly what these checks do not cover: they replace
+neither Kindle Previewer for the ebook nor a printed proof for the paper edition.
+
+**State on disk**, at the bottom, is available in every phase. It looks at the files that really
+exist against those the specification plans, and names the chapters that are not there. It is the
+only report worth trusting.
+
+**Putting a book aside, and starting over.** The phases write to disk at every step, which
+is why the work is never lost — and also why closing the program does not end it: reopening finds
+the book exactly where it was. The bottom row of the tab is how you leave it behind.
+
+**Save the work** puts the book aside as it stands, in a single zip file inside
+`<project>/saves/`, and the work carries on from where you are — it is a copy, not an exit. Give
+it a name you will recognise later; the list shows the date, the phase, how many chapters and how
+much it weighs.
+
+**Resume a saved book…** puts one back into production. What is in the folder at that moment is
+saved first, by itself, so returning to an earlier point never costs you the later one.
+
+**Start over** clears all the phases and goes back to the interview. It first says what is in
+the current book — chapters, words, phase — and asks what becomes of it: *Save and start over*,
+which is the preselected answer and leaves it in the list of saves, or *Delete and start over*,
+which is permanent. If the save fails for any reason, nothing is deleted: you asked for it to be
+kept. Imported documents, the project database and everything outside `book/` are never touched.
+
+The same three actions exist at the command line: `forge save`, `forge saves`, `forge restore`,
+and `forge reset` (which puts the book aside unless you pass `--delete`).
 
 ## 4.7 Complete the content
 
@@ -439,9 +659,18 @@ during long jobs, and it survives closing the program.
 
 ## 5.1 Output format and layout
 
-Every screen that produces a book has a **Format** menu: **DOCX**, **PDF** or **Markdown**. The
-format is your choice, not a consequence of what you started from — a PDF can come back as a DOCX,
-a DOCX as a PDF.
+Every screen that produces a book has a **Format** menu: **DOCX**, **PDF**, **Markdown** or
+**EPUB**. The format is your choice, not a consequence of what you started from — a PDF can come
+back as a DOCX, a DOCX as a PDF.
+
+All of them come out of the same typesetter as the phases (§4.6), so a book exported from
+here is set like a book and not printed like a document: real trim size instead of A4, asymmetric
+margins that account for the fold, hyphenation, chapters opening on a right-hand page, running
+heads, a contents page, and the per-chapter sources merged into one bibliography at the back.
+
+EPUB is the exception to what follows, and not out of laziness: an ebook has no pages to preserve —
+the typeface and the size are chosen by whoever reads it. That is also why *Update a book*, whose
+file exists to be read for its marked changes, does not offer it.
 
 When a book is translated or rewritten, **only the text is sent to the model**. Everything else is
 the program's business and is put back where it was:
@@ -571,6 +800,10 @@ them. The settings worth knowing:
 | `llm.models.heavy` | optional model for quality passes |
 | `llm.request_timeout_s` | seconds before a request is given up (default 900) |
 | `llm.concurrency` | parallel requests for indexing and section labelling (default 4) |
+| `research.min_page_chars` | how much prose must remain after cleaning a web page for it to count as readable (default 400); below, it is recorded as *unreadable* and never sent to the model |
+| `research.min_relevance` | threshold (0–1, default 0.25) of the model's judgement of whether a page serves the point; below, the page is recorded as *not relevant*; 0 = no filter |
+| `research.excluded_domains` | domains nothing is downloaded from (default YouTube and `amazon.*`, every country); results are recorded as *excluded* |
+| `llm.temperature`, `llm.top_p`, `llm.top_k`, `llm.min_p`, `llm.presence_penalty`, `llm.repetition_penalty` | sampling. Unset (default) = not sent: the model server decides. When set, the value applies to every request. A zero temperature asked for by the program is no longer sent; write `temperature = 0` if you really want greedy decoding |
 | `chunking.target_tokens` | size of the text blocks (default 1500) |
 | `project.language` | language of generated content |
 | `ui.language` | language of the interface |

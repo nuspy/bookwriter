@@ -51,14 +51,9 @@ COMPOSE_SCHEMA: dict[str, Any] = {
 class SupportsChatJson(Protocol):
     def chat_json(
         self, messages: list[dict[str, str]], *, schema: dict, model: str | None = ...,
-        temperature: float = ..., max_tokens: int | None = ...,
     ) -> Any:
         ...
 
-
-# A temperatura zero il modello, davanti a materiali simili, ripete le stesse formule capitolo
-# dopo capitolo: per la prosa serve varietà.
-PROSE_TEMPERATURE = 0.8
 
 
 @dataclass
@@ -230,7 +225,6 @@ def _generate_part(
         [{"role": "system", "content": system}, {"role": "user", "content": mat}],
         schema=COMPOSE_SCHEMA,
         model=model,
-        temperature=PROSE_TEMPERATURE,
         # Nessun tetto ai token: sui modelli che ragionano il pensiero consuma il budget
         # prima ancora di iniziare a scrivere, e la risposta torna vuota o troncata.
     )

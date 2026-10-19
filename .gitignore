@@ -24,3 +24,9 @@ htmlcov/
 # OS
 Thumbs.db
 .DS_Store
+
+# Trawl / Node
+node_modules/
+tools/trawl/node_modules/
+tools/trawl/**/node_modules/
+tools/trawl/.env

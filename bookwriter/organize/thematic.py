@@ -34,7 +34,7 @@ from bookwriter.organize.common import (
 
 
 class SupportsChat(Protocol):
-    def chat(self, messages: list[dict[str, str]], *, model: str | None = ..., max_tokens: int | None = ...) -> str:
+    def chat(self, messages: list[dict[str, str]], *, model: str | None = ...) -> str:
         ...
 
 

@@ -1,0 +1,112 @@
+# Book project configuration.
+# Everything the composer needs to know that is specific to this title.
+# Delete what you do not use: every field has a sensible default.
+
+book:
+  title: "Untitled"
+  subtitle: ""
+  author: ""
+  language: "it"            # it | en | es | fr | de — drives labels and hyphenation
+  publisher: ""             # imprint name, or "Edizione dell'autore"
+  year: "2026"
+  edition: "Prima edizione"
+  isbn: ""                  # leave empty if the store assigns one
+  rights: ""                # defaults to the standard notice for the language
+  description: ""           # one paragraph, used in the ebook metadata
+  keywords: []              # store categories / BISAC-like subjects
+  dedication: ""            # use \n for a line break
+  epigraph: ""
+  epigraph_source: ""
+
+# --------------------------------------------------------------- physical --
+format:
+  preset: a5                # a5 | b-format | 5x8 | 5.5x8.5 | 6x9 | 7x10 | a4
+  # width_mm / height_mm override the preset when the printer wants an odd size
+  # margins default to a ratio of the trim; set them only to override
+  # margin_inner_mm: 18     # the gutter side, always the wider one
+  # margin_outer_mm: 15
+  # margin_top_mm: 16
+  # margin_bottom_mm: 18
+  bleed_mm: 3               # cover overhang; ask the printer, 3 mm is standard
+  chapters_open_recto: true # each chapter starts on a right-hand page
+  pad_to_even: true         # perfect binding needs an even number of sides
+
+typography:
+  serif: ""                 # family name; empty = pick the best one installed
+  sans: ""
+  # body_size: 10.6         # pt; empty = derived from the measure
+  # leading: 14.6
+  first_line_indent_mm: 5
+  hyphenation: auto         # auto | it_IT | en_GB | off
+  justify: true
+
+# ---------------------------------------------------------------- sources --
+source:
+  root: "."
+  pattern: "chapters/*.md"  # or "*/capitolo_*.md" for chapters kept in folders
+  exclude: ["output/**", "front/**", "back/**", "research/**", "README.md",
+            "MASTER_SPEC.md"]
+  # how a chapter heading is written in the sources
+  chapter_regex: '^#\s+(?:Capitolo|Chapter|Cap\.?)\s*(\d+)\s*[:\-—–]\s*(.*)$'
+  part_regex: '^#\s+(?:PARTE|PART)\s+([IVXLC]+)\s*[—\-:–]?\s*(.*)$'
+  title_split: "—"          # splits "Title — Subtitle" in a chapter heading
+  strip_production_noise: true      # drops word counts, progress tables, TODOs
+  extract_chapter_references: true  # per-chapter sources move to the back
+
+# Parts are optional. Omit the whole block for a flat book; the composer also
+# recognises "# PARTE I — …" headings placed at the top of a chapter file.
+parts: []
+# parts:
+#   - number: 1
+#     title: "LE FONDAMENTA"
+#     chapters: [1, 2, 3, 4]
+#     intro_file: "front/part-1.md"
+
+# ------------------------------------------------------------------ matter --
+# Omit both blocks to auto-discover front/*.md and back/*.md in reading order.
+front_matter: []
+# front_matter:
+#   - id: notice
+#     file: front/avvertenza.md
+#   - id: introduction
+#     file: front/introduzione.md
+
+back_matter: []
+# back_matter:
+#   - id: glossary
+#     file: back/glossario.md
+#   - id: bibliography          # generated from the chapter sources
+#   - id: about_author
+#     file: back/biografia.md
+
+bibliography:
+  note: ""                  # optional paragraph opening the bibliography
+  file: ""                  # extra entries kept outside the chapters
+
+# ------------------------------------------------------------------ cover --
+cover:
+  image: ""                 # REQUIRED for a print edition — ask the author
+  compose_title: true       # set title and author over the artwork
+  tagline: ""               # small line above the title
+  title_color: "#D6B266"
+  text_color: "#EEEAE2"
+  band_background: "#060607"
+  trim_bottom_ratio: 0.0    # crop this share off the artwork's foot
+  include_in_pdf: true
+
+# ----------------------------------------------------------------- output --
+output:
+  directory: "output"
+  basename: ""              # empty = derived from the title
+  formats: [pdf, docx, epub, md]
+  pdf_with_cover: true      # cover as page one, plus its blank verso
+  pdf_interior_copy: true   # separate interior-only file for the printer
+
+# Override any printed label if the house style differs.
+labels: {}
+# labels:
+#   chapter: "Lezione"
+#   part: "Modulo"
+
+# Replace the generated copyright page entirely, line by line.
+colophon: []

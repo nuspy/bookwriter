@@ -15,13 +15,29 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
+from bookwriter.forge import saves as fg_saves
 from bookwriter.gui.main_window import MainWindow
+from bookwriter.gui.worker import INTERROTTO
+from bookwriter.llm.client import LLMCancelled
 
 
 @pytest.fixture(scope="module")
 def qapp():
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+@pytest.fixture(autouse=True)
+def niente_rete_verso_i_fornitori(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cambiare fornitore nel pannello interroga davvero il suo catalogo dei modelli.
+
+    In un test quella richiesta parte su un thread vero verso un indirizzo vero: sporca la
+    macchina di chi esegue la suite e, se torna in ritardo, finisce dentro il finto server
+    HTTP del file successivo facendolo fallire senza colpa. Qui i modelli si impostano a
+    mano (``win._models``), quindi la lettura dal fornitore non serve a nessun test.
+    """
+    monkeypatch.setattr(MainWindow, "_load_models",
+                        lambda self, *, force=False: self._fill_model_combos())
 
 
 def test_mainwindow_builds(qapp, temp_workspace: Path) -> None:
@@ -229,13 +245,40 @@ def test_provider_switch_shows_key_field_and_prices(qapp, temp_workspace: Path) 
     assert "non disponibile presso questo fornitore" in win.set_reasoning.itemText(0)
     win.set_reasoning.setCurrentIndex(chat_idx)
 
-    # La chiave viene salvata insieme al fornitore.
+    # La chiave finisce nel registro comune, non nel file del progetto: è la stessa credenziale
+    # per tutti i progetti, e i file di progetto finiscono nei commit.
     win.set_api_key.setText("chiave-di-prova")
     win._save_settings()
     cfg = win.pm.config_for(win.pm.active_slug())
     assert cfg.llm.provider == "nebius"
-    assert cfg.llm.api_key == "chiave-di-prova"
     assert cfg.llm.models.reasoning == "Qwen/Qwen3-235B-A22B-Instruct-2507"
+    assert cfg.llm.api_key == "", "la chiave non deve restare nel file del progetto"
+    assert cfg.llm.resolved_api_key() == "chiave-di-prova", "ma deve continuare a essere usata"
+
+    from llmswitch import Registry
+
+    assert Registry().api_key_for("nebius") == "chiave-di-prova"
+    win.close()
+
+
+def test_a_key_already_in_the_project_file_keeps_working(qapp, temp_workspace: Path) -> None:
+    """Chi aveva la chiave nel config.toml non deve accorgersi del cambiamento.
+
+    Il campo la mostra ancora, le richieste la usano ancora, e salvando le impostazioni non
+    viene cancellata: toglierla lascerebbe senza accesso chi non ha ancora popolato il registro.
+    """
+    win = MainWindow()
+    win.pm.create("Progetto con chiave vecchia")
+    cfg = win.pm.config_for(win.pm.active_slug())
+    vecchia = cfg.model_copy(update={
+        "llm": cfg.llm.model_copy(update={"provider": "nebius", "api_key": "chiave-nel-file"}),
+    })
+    win.pm.save_config_for(win.pm.active_slug(), vecchia)
+
+    # Il campo si popola senza passare da `_refresh_settings`, che andrebbe a chiedere
+    # l'elenco dei modelli al server: un test non deve dipendere da cosa c'è acceso fuori.
+    assert win._chiave_in_uso(vecchia) == "chiave-nel-file"
+    assert vecchia.llm.resolved_api_key() == "chiave-nel-file"
     win.close()
 
 
@@ -383,18 +426,395 @@ def test_save_dialog_suggests_a_name_and_remembers_the_folder(qapp, temp_workspa
 
 
 def test_every_screen_that_produces_a_file_lets_you_choose_its_format(qapp, temp_workspace: Path) -> None:
-    """DOCX, PDF o Markdown: la scelta c'è ovunque esca un libro, non solo nell'antologia."""
+    """DOCX, PDF, Markdown o EPUB: la scelta c'è ovunque esca un libro, non solo nell'antologia."""
     win = MainWindow()
     tendine = {
         "antologia e prosa": win.format_combo,
         "riscrivi in altro stile": win.rw_format,
         "traduci": win.tr_format,
-        "scrivi da zero": win.au_format,
-        "aggiorna un libro": win.up_format,
     }
     for schermata, combo in tendine.items():
         valori = [combo.itemData(i) for i in range(combo.count())]
-        assert valori == ["docx", "pdf", "md"], schermata
+        assert valori == ["docx", "pdf", "md", "epub"], schermata
+    # «Aggiorna un libro» non offre l'EPUB, e per un motivo: quel file serve a rileggere le
+    # modifiche marcate, e un libro elettronico non ha né pagine né marcature di revisione.
+    assert [win.up_format.itemData(i) for i in range(win.up_format.count())] == ["docx", "pdf", "md"]
+    # «Scrivi da zero» non ha una tendina: i formati li sceglie nella fase di composizione,
+    # perché lì escono tutti insieme e ciascuno serve a un canale diverso.
+    assert (win.fg_pdf.isChecked(), win.fg_docx.isChecked(), win.fg_epub.isChecked()) == (True,) * 3
+    win.close()
+
+
+def _forge_inline(win, monkeypatch) -> None:
+    """Esegue in linea il lavoro di sfondo: nei test non c'è un ciclo di eventi da aspettare."""
+    def subito(fn, on_done, busy="", progressable=False, on_error=None, on_note=None,
+               stoppable=False):
+        # Stessa firma che passa il Worker vero: con il racconto in corso la funzione riceve
+        # due callback, non una. Se qui ne passassimo sempre una sola, i test direbbero «va
+        # tutto bene» mentre la finestra vera si rompe al primo clic.
+        def avanzamento(*_a) -> None:
+            """Nei test la barra non c'è: l'avanzamento si accetta e si butta."""
+
+        nota = on_note if on_note is not None else avanzamento
+        try:
+            if progressable and on_note is not None:
+                risultato = fn(avanzamento, nota)
+            elif progressable:
+                risultato = fn(avanzamento)
+            else:
+                risultato = fn()
+            on_done(risultato)
+        except Exception as exc:  # gli errori si vedono, non si ingoiano
+            if on_error is None:
+                raise
+            on_error(str(exc))
+        except LLMCancelled:  # «Interrompi»: come fa il Worker vero
+            if on_error is None:
+                raise
+            on_error(INTERROTTO)
+
+    monkeypatch.setattr(win, "_run_bg", subito)
+
+
+def test_the_phases_tab_walks_the_whole_way(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """La scheda «Scrivi da zero» porta davvero dal colloquio al libro composto."""
+    from tests.test_forge import FintoModello
+
+    win = MainWindow()
+    win.pm.create("Sette fasi")
+    monkeypatch.setattr(win, "_client", lambda slug: FintoModello())
+    _forge_inline(win, monkeypatch)
+    win._refresh_forge()
+
+    # Fase 1 — una conversazione: l'autore scrive, la risposta arriva, il quaderno cresce;
+    # poi l'autore chiude e il resto lo decide l'assistente.
+    win._forge_send("Un giallo a Trieste, d'inverno.")
+    bolle = win.fg_chat.view.bubbles()
+    assert [b.role for b in bolle] == ["assistant", "user", "assistant"]
+    assert bolle[-1].text == FintoModello.RISPOSTA
+    assert "Elena Sartori" in win.fg_chat.notebook.toPlainText()
+    win._forge_finish_interview()
+    forge = win._forge()
+    assert forge.state.interview_closed
+    assert "Il libro si apre con il corpo nel porto" in win.fg_chat.view.bubbles()[-1].text
+    assert win._forge_advance() is None and win._forge().state.phase == "spec"
+
+    # Fasi 2-7, dai pulsanti della scheda.
+    win._forge_make_spec()
+    win._forge_approve_spec()
+    win._forge_decline_research()
+    win._forge_write_all()
+    win._forge_produce()
+    win.fg_no_cover.setChecked(True)
+    win.fg_epub.setChecked(False)  # l'EPUB senza copertina è solo un avviso in più
+    win._forge_build()
+    win._forge_handover()
+
+    forge = win._forge()
+    assert sorted(forge.project.written_chapters()) == [1, 2, 3]
+    assert forge.project.spec_path.exists() and forge.project.config_path.exists()
+    assert forge.project.notes_path.exists()
+    assert [f.state for f in forge.phases()] == ["fatta"] * 8
+    # Le pastiglie di fase seguono lo stato, non restano quelle di partenza.
+    assert win.fg_phase_buttons["build"].styleSheet()
+    win.close()
+
+
+def _scheda_libro(win, monkeypatch, client=None) -> None:
+    from tests.test_forge import FintoModello
+
+    win.pm.create("Conversazione")
+    modello = client or FintoModello()
+    monkeypatch.setattr(win, "_client", lambda slug: modello)
+    _forge_inline(win, monkeypatch)
+    win._refresh_forge()
+
+
+def test_the_conversation_opens_with_an_invitation(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """Si comincia raccontando il libro, non rispondendo a un modulo."""
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    bolle = win.fg_chat.view.bubbles()
+    assert [b.role for b in bolle] == ["assistant"]
+    assert "Raccontami il libro" in bolle[0].text
+    assert win.fg_center.currentWidget() is win.fg_chat
+    # Aprire la scheda non è lavoro: niente da salvare finché l'autore non scrive.
+    assert not fg_saves.has_work(win._forge().project)
+    win.close()
+
+
+def test_a_reply_that_does_not_arrive_offers_a_retry(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """Il modello non risponde: quello che l'autore ha scritto resta, e «Riprova» lo rimanda."""
+    from bookwriter.llm.client import LLMError
+    from tests.test_forge import FintoModello
+
+    class UnaVoltaNo(FintoModello):
+        caduto = False
+
+        def chat(self, messages, **kw):
+            if not self.caduto and "Sei un editor esperto" in messages[0]["content"]:
+                self.caduto = True
+                raise LLMError("il server non risponde")
+            return super().chat(messages, **kw)
+
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch, UnaVoltaNo())
+    win._forge_send("Un giallo a Trieste.")
+    from bookwriter.gui.chat import Notice
+
+    avvisi = win.fg_chat.view.findChildren(Notice)
+    assert avvisi and avvisi[-1].button is not None
+    assert win._forge().state.transcript[-1]["role"] == "user"
+
+    avvisi[-1].button.click()
+
+    trascritto = win._forge().state.transcript
+    assert [b["role"] for b in trascritto] == ["assistant", "user", "assistant"]
+    assert win.fg_chat.view.bubbles()[-1].text == FintoModello.RISPOSTA
+    win.close()
+
+
+def test_what_is_written_while_the_assistant_is_busy_waits_its_turn(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    win._chat_busy = True  # l'assistente sta ancora aggiornando il quaderno
+    win._forge_send("Il colpevole è il fratello.")
+    win._forge_send("E la vittima lo sapeva.")
+    assert [testo for _, testo in win._chat_queue] == ["Il colpevole è il fratello.",
+                                                     "E la vittima lo sapeva."]
+    assert [b.role for b in win.fg_chat.view.bubbles()][-2:] == ["user", "user"], "si vedono subito"
+
+    win._chat_busy = False
+    win._forge_chat_next()
+
+    trascritto = win._forge().state.transcript
+    assert trascritto[1]["text"] == "Il colpevole è il fratello.\n\nE la vittima lo sapeva."
+    assert win._chat_queue == []
+    win.close()
+
+
+def test_a_message_sent_during_another_operation_is_kept_not_lost(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Con un'altra operazione in corso la risposta non può partire: il testo resta dov'è e la
+    conversazione non resta «occupata» per sempre."""
+    from PySide6.QtWidgets import QMessageBox
+
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
+    win._workers.add(object())  # una traduzione, la coda, una stesura…
+    win.fg_chat.composer.input.setPlainText("Un giallo a Trieste.")
+    win._forge_send(win.fg_chat.composer.text())
+    assert win.fg_chat.composer.text() == "Un giallo a Trieste."
+    assert [b.role for b in win.fg_chat.view.bubbles()] == ["assistant"]
+    assert not win._chat_busy
+    assert win._forge().state.transcript == []
+    win._workers.clear()
+    win.close()
+
+
+def test_switching_project_shows_that_project_s_conversation(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    primo = win.pm.active_slug()
+    win._forge_send("Un giallo a Trieste.")
+    win.tabs.setCurrentIndex(next(i for i in range(win.tabs.count())
+                                  if win.tabs.tabText(i) == "Scrivi da zero"))
+    secondo = win.pm.create("Un altro libro").slug
+    win.pm.set_active(primo)
+    win._reload_projects()
+    assert win.project_combo.currentData() == primo
+
+    win.project_combo.setCurrentIndex(win.project_combo.findData(secondo))
+    assert win.pm.active_slug() == secondo
+    assert [b.role for b in win.fg_chat.view.bubbles()] == ["assistant"], "il libro nuovo è vuoto"
+    win.project_combo.setCurrentIndex(win.project_combo.findData(primo))
+    assert [b.role for b in win.fg_chat.view.bubbles()] == ["assistant", "user", "assistant"]
+    win.close()
+
+
+def test_the_chosen_style_reaches_the_assistant_and_is_remembered(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Lo stile non si chiede: lo dice la tendina, e l'assistente lo conosce."""
+    from bookwriter.db import project_schema
+    from tests.test_forge import FintoModello
+
+    modello = FintoModello()
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch, modello)
+    db = win.pm.paths(win.pm.active_slug()).db
+    stile = project_schema.save_style(db, "Noir asciutto", "abstract",
+                                      {"name": "Noir asciutto", "origin": "abstract",
+                                       "dimensions": {"ritmo": "frasi brevi, secche"}})
+    win._refresh_forge()
+    win.fg_style.setCurrentIndex(win.fg_style.findData(stile))
+
+    win._forge_send("Un giallo a Trieste.")
+
+    sistema = modello.conversazioni[-1][0]["content"]
+    assert "frasi brevi, secche" in sistema
+    assert win._forge().state.style_id == stile
+    win.fg_style.setCurrentIndex(0)
+    win._refresh_forge()
+    assert win.fg_style.currentData() is None, "la tendina rilegge lo stile salvato nel libro"
+    win.close()
+
+
+def test_a_close_request_written_in_the_chat_closes_the_conversation(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """«Puoi iniziare il lavoro»: l'app chiude da sola, e mostra come andare avanti."""
+    from bookwriter.gui.chat import Notice
+    from tests.test_forge import FintoModello
+
+    modello = FintoModello()
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch, modello)
+    win._forge_send("Un giallo a Trieste.")
+    assert not win._forge().state.interview_closed
+
+    modello.chiude = True
+    win._forge_send("Puoi iniziare il lavoro. Buon lavoro!")
+
+    forge = win._forge()
+    assert forge.state.interview_closed, "senza premere «Ho finito»"
+    assert "Il libro si apre con il corpo nel porto" in win.fg_chat.view.bubbles()[-1].text
+    avvisi = [a for a in win.fg_chat.view.findChildren(Notice) if a.button is not None]
+    assert avvisi and avvisi[-1].button.text() == "Passa alla specifica"
+    assert not win._chat_busy
+
+    avvisi[-1].button.click()
+    assert win._forge().state.phase == "spec"
+    win.close()
+
+
+def test_a_conversation_the_author_did_not_ask_to_close_stays_open(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    from bookwriter.gui.chat import Notice
+    from tests.test_forge import FintoModello
+
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch, FintoModello())
+    win._forge_send("Un giallo a Trieste.")
+    win._forge_send("Parliamo dei personaggi.")
+    forge = win._forge()
+    assert not forge.state.interview_closed
+    assert forge.state.phase == "interview"
+    assert not [a for a in win.fg_chat.view.findChildren(Notice) if a.button is not None]
+    win.close()
+
+
+def test_a_close_request_does_not_close_a_book_that_is_no_longer_open(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Se nel frattempo si apre un altro progetto, la chiusura non tocca quello sbagliato."""
+    from tests.test_forge import FintoModello
+
+    modello = FintoModello()
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch, modello)
+    primo = win.pm.active_slug()
+    win._forge_send("Un giallo a Trieste.")
+    modello.chiude = True
+    win.pm.create("Un altro libro")  # il progetto attivo cambia prima dell'aggiornamento
+    win._forge_update_notebook(primo)
+    assert not win._forge_for(primo).state.interview_closed
+    assert not win._forge().state.interview_closed
+    assert not win._chat_busy
+    win.close()
+
+
+def _intervista_lampo(win) -> None:
+    """Una battuta sola, poi «decidi tu il resto»."""
+    win._forge_send("Un giallo a Trieste.")
+    win._forge_finish_interview()
+
+
+def test_the_chapter_sources_button_tells_what_it_finds_chapter_by_chapter(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Il pulsante «Cerca le fonti dei capitoli» racconta mentre lavora, capitolo per capitolo.
+
+    Il racconto arriva da un secondo callback, distinto da quello dell'avanzamento. Quando il
+    pulsante non lo accettava, premerlo dava un errore sull'arità della funzione invece delle
+    fonti: nessun test lo premeva, e il difetto è arrivato fino all'autore.
+    """
+    from bookwriter.forge import research as rs
+    from tests.test_forge import FintoModello
+
+    win = MainWindow()
+    win.pm.create("Fonti dei capitoli")
+    monkeypatch.setattr(win, "_client", lambda slug: FintoModello())
+    monkeypatch.setattr(
+        rs, "_sources_from_model",
+        lambda *a, **k: {"findings": [{"claim": "Il mare si alza", "detail": "di 3 mm l'anno",
+                                       "level": "B", "source": "IPCC (2023)",
+                                       "url": "https://esempio.org"}],
+                         "open_questions": []},
+    )
+    _forge_inline(win, monkeypatch)
+    win._refresh_forge()
+    _intervista_lampo(win)
+    win._forge_make_spec()
+    win._forge_approve_spec()
+
+    win._forge_chapter_research()
+    assert win._forge().state.research_done is False, "le fonti senza il panorama non bastano"
+    win._forge_landscape()
+    win._forge_chapter_research()
+
+    testo = win.fg_log.toPlainText()
+    forge = win._forge()
+    assert forge.state.research_done is True
+    # Una riga per capitolo, non un solo riepilogo alla fine: è quello che si vede scorrere.
+    for numero in (c["number"] for c in forge.state.outline):
+        assert f"Capitolo {numero}" in testo
+    assert (forge.project.research_dir / "sources.md").exists()
+    win.close()
+
+
+def test_the_phases_tab_says_what_is_missing_instead_of_guessing(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Comporre senza copertina si ferma e lo dice: la copertina la fornisce l'autore."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from tests.test_forge import FintoModello
+
+    win = MainWindow()
+    win.pm.create("Senza copertina")
+    monkeypatch.setattr(win, "_client", lambda slug: FintoModello())
+    _forge_inline(win, monkeypatch)
+    win._refresh_forge()
+    detto: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: detto.append(a[2]) or QMessageBox.StandardButton.Ok))
+
+    from tests.test_forge import _quaderno_pieno
+
+    forge = win._forge()
+    _quaderno_pieno(forge.state)
+    forge.save()
+    win._forge_make_spec()
+    win._forge_approve_spec()
+    win._forge_write_all()
+    win._forge_produce()
+    win.fg_no_cover.setChecked(False)
+    win._forge_build()
+
+    # senza copertina la composizione riesce, senza finestre che la fermino, e lo dice nel
+    # riquadro di stato; la copertina non è stata inventata
+    assert not detto
+    assert any(forge.project.out_dir.glob("*.pdf"))
+    assert "Composto senza copertina" in win.fg_todo.text()
+    assert not list(forge.project.out_dir.glob("*cover*"))
     win.close()
 
 
@@ -544,6 +964,21 @@ def test_every_language_translates_every_visible_string() -> None:
         assert not mancanti, f"{nome} ({codice}) senza traduzione per: {mancanti[:5]}"
 
 
+def test_the_opening_of_the_conversation_is_translated_everywhere() -> None:
+    """L'apertura passa da una costante, non da una stringa scritta dentro t(): il controllo
+    sopra non la vede, e un autore inglese si troverebbe accolto in italiano."""
+    import json
+
+    from bookwriter.forge.interview import OPENING
+    from bookwriter.gui.i18n import LOCALES_DIR, UI_LANGUAGES
+
+    for codice, nome in UI_LANGUAGES:
+        if codice == "it":
+            continue
+        catalogo = json.loads((LOCALES_DIR / f"{codice}.json").read_text(encoding="utf-8"))
+        assert catalogo.get(OPENING, "").strip(), f"{nome}: manca l'apertura della conversazione"
+
+
 def test_the_interrupt_button_follows_the_interface_language(qapp, temp_workspace: Path) -> None:
     """Vive nella barra di stato, fuori dalle schede: senza cura resterebbe l'unica parola italiana."""
     from bookwriter.gui import i18n
@@ -646,4 +1081,994 @@ def test_changing_the_queue_writes_it_to_the_project(qapp, temp_workspace: Path)
 
     win._remove_from_queue()
     assert [b.title for b in load_queue(ppaths.db)] == ["Primo"]
+    win.close()
+
+
+def test_a_subscription_provider_shows_its_state_instead_of_a_key_field(
+    qapp, temp_workspace: Path, monkeypatch
+) -> None:
+    """Con un abbonamento non c'è nulla da incollare: un campo chiave vuoto ingannerebbe.
+
+    Al suo posto si dice se è collegato e, quando non lo è, il comando che lo collega.
+    """
+    import llmswitch
+
+    win = MainWindow()
+    win.pm.create("Progetto abbonamento")
+
+    monkeypatch.setattr(llmswitch, "stato", lambda nome: {
+        "utilizzabile": False, "rinnovabile": False, "scade_fra_ore": None,
+        "come_accedere": "codex login",
+    })
+    win.set_provider.setCurrentIndex(win.set_provider.findData("codex_oauth"))
+    assert win.set_api_key.isHidden() is True, "nessuna chiave da chiedere"
+    assert win.set_subscription.isHidden() is False
+    assert "codex login" in win.set_subscription.text()
+
+    monkeypatch.setattr(llmswitch, "stato", lambda nome: {
+        "utilizzabile": True, "rinnovabile": True, "scade_fra_ore": 37.8,
+        "come_accedere": "codex login",
+    })
+    win._apply_provider_ui()
+    testo = win.set_subscription.text()
+    assert "Collegato" in testo and "37.8" in testo
+
+    # Tornando a un fornitore a chiave, la riga dell'abbonamento sparisce.
+    win.set_provider.setCurrentIndex(win.set_provider.findData("deepseek"))
+    assert win.set_subscription.isHidden() is True
+    assert win.set_api_key.isHidden() is False
+    win.close()
+
+
+def test_the_subscription_line_never_shows_a_token(qapp, temp_workspace: Path) -> None:
+    """La riga finisce negli screenshot delle segnalazioni: dentro non ci va una credenziale."""
+    win = MainWindow()
+    win.pm.create("Progetto riservatezza")
+    for nome in ("codex_oauth", "qwen_oauth", "grok_oauth"):
+        if win.set_provider.findData(nome) < 0:
+            continue
+        win.set_provider.setCurrentIndex(win.set_provider.findData(nome))
+        testo = win.set_subscription.text()
+        assert "Bearer" not in testo and "eyJ" not in testo, nome
+    win.close()
+
+
+def test_closing_the_window_does_not_leave_the_work_running(
+    qapp, temp_workspace: Path, monkeypatch
+) -> None:
+    """Senza questo, chiudere la finestra lascia un processo vivo che traduce di nascosto.
+
+    Chi riapre l'applicazione ne avvia una seconda, e i due si contendono lo stesso modello.
+    È successo: nei tempi dei blocchi si vede l'inglese e il francese che si alternano sulla
+    stessa scheda, con un blocco ogni mezz'ora invece che ogni pochi minuti.
+    """
+    from PySide6.QtCore import QThreadPool
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QMessageBox
+
+    from bookwriter.gui import main_window as mw
+
+    win = MainWindow()
+    win.pm.create("Progetto chiusura")
+
+    # Senza lavori in corso si chiude e basta, senza domande.
+    evento = QCloseEvent()
+    win.closeEvent(evento)
+    assert evento.isAccepted()
+
+    # Con un lavoro in corso si chiede. Non si aspettano thread veri: qui non ce ne sono, e
+    # l'uscita forzata va neutralizzata — un test che chiama os._exit ucciderebbe la suite.
+    monkeypatch.setattr(QThreadPool, "waitForDone", lambda self, msec=-1: True)
+    monkeypatch.setattr(MainWindow, "_esci_a_forza", staticmethod(lambda: None))
+    class _Lungo:
+        progressable = True   # solo i lavori lunghi fanno chiedere conferma
+
+    win._workers.add(_Lungo())
+
+    monkeypatch.setattr(mw.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.StandardButton.No))
+    evento = QCloseEvent()
+    win.closeEvent(evento)
+    assert not evento.isAccepted(), "un «no» deve lasciare la finestra aperta"
+    assert win._stop_requested is False, "e non deve fermare niente"
+
+    monkeypatch.setattr(mw.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    evento = QCloseEvent()
+    win.closeEvent(evento)
+    assert evento.isAccepted()
+    assert win._stop_requested is True, "un «sì» chiede l'interruzione prima di uscire"
+    assert win._queue_stop is True
+    win._workers.clear()
+
+
+def test_a_stubborn_job_does_not_keep_the_process_alive(qapp, temp_workspace: Path,
+                                                        monkeypatch) -> None:
+    """Se il lavoro non si ferma in tempo, si esce lo stesso.
+
+    Qt aspetta i thread del pool prima di far terminare il processo: senza uscita forzata,
+    chiudere la finestra lascia un programma invisibile che continua a tradurre. A riaprirlo se
+    ne avvia un secondo e i due si contendono la scheda — è successo, ed è costato ore.
+    """
+    from PySide6.QtCore import QThreadPool
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QMessageBox
+
+    from bookwriter.gui import main_window as mw
+
+    win = MainWindow()
+    win.pm.create("Progetto ostinato")
+
+    class _Lungo:
+        progressable = True
+
+    win._workers.add(_Lungo())
+    # Il lavoro NON si ferma: waitForDone scade.
+    monkeypatch.setattr(QThreadPool, "waitForDone", lambda self, msec=-1: False)
+    monkeypatch.setattr(mw.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    uscite = []
+    monkeypatch.setattr(MainWindow, "_esci_a_forza", staticmethod(lambda: uscite.append(True)))
+
+    evento = QCloseEvent()
+    win.closeEvent(evento)
+    assert evento.isAccepted()
+    assert uscite == [True], "un lavoro che non si ferma non deve tenere in vita il processo"
+    win._workers.clear()
+
+
+def test_a_job_that_stops_in_time_exits_the_normal_way(qapp, temp_workspace: Path,
+                                                       monkeypatch) -> None:
+    """Se si ferma da sé non serve forzare niente: si esce per la via normale."""
+    from PySide6.QtCore import QThreadPool
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QMessageBox
+
+    from bookwriter.gui import main_window as mw
+
+    win = MainWindow()
+    win.pm.create("Progetto ubbidiente")
+
+    class _Lungo:
+        progressable = True
+
+    win._workers.add(_Lungo())
+    monkeypatch.setattr(QThreadPool, "waitForDone", lambda self, msec=-1: True)
+    monkeypatch.setattr(mw.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    uscite = []
+    monkeypatch.setattr(MainWindow, "_esci_a_forza", staticmethod(lambda: uscite.append(True)))
+
+    win.closeEvent(QCloseEvent())
+    assert uscite == [], "nessuna uscita forzata se il lavoro si è fermato"
+    win._workers.clear()
+
+
+# --------------------------------------------------------------------------- #
+#  mettere da parte il libro, riprenderlo, ricominciare
+# --------------------------------------------------------------------------- #
+def _libro_a_meta(win) -> None:
+    """Un libro con dentro qualcosa da perdere: due capitoli, la specifica, lo stato."""
+    from bookwriter.forge.project import ForgeState
+
+    forge = win._forge()
+    progetto = forge.project
+    progetto.scaffold()
+    progetto.spec_path.write_text("# Specifica\n\n| 1 | L'apertura |\n| 2 | Il secondo |\n",
+                                  encoding="utf-8")
+    for numero, titolo in ((1, "L'apertura"), (2, "Il secondo")):
+        progetto.chapter_path(numero, titolo).write_text(
+            f"# Capitolo {numero}: {titolo}\n\n" + " ".join(["parola"] * 500), encoding="utf-8")
+    progetto.save_state(ForgeState(phase="writing", spec_approved=True))
+    win._refresh_forge()
+
+
+def test_the_work_can_be_put_aside_and_picked_up_again(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Mettere da parte non interrompe niente: il lavoro prosegue da dove sta."""
+    from PySide6.QtWidgets import QInputDialog
+
+    win = MainWindow()
+    win.pm.create("Libro da mettere da parte")
+    _forge_inline(win, monkeypatch)
+    _libro_a_meta(win)
+
+    monkeypatch.setattr(QInputDialog, "getText",
+                        staticmethod(lambda *a, **k: ("com'era a metà", True)))
+    win._forge_save_work()
+
+    salvataggi = fg_saves.list_saves(win.pm.paths(win.pm.active_slug()).saves)
+    assert [s.name for s in salvataggi] == ["com'era a metà"]
+    assert salvataggi[0].chapters == 2
+    assert sorted(win._forge().project.written_chapters()) == [1, 2], "il libro resta al suo posto"
+    assert "1 salvataggio" in win.fg_saves_state.text()
+
+    # Il lavoro prosegue e prende una direzione sbagliata: si torna al salvataggio.
+    progetto = win._forge().project
+    progetto.chapter_path(3, "Da buttare").write_text("# Capitolo 3\n", encoding="utf-8")
+    etichetta = salvataggi[0].label()
+    monkeypatch.setattr(QInputDialog, "getItem",
+                        staticmethod(lambda *a, **k: (etichetta, True)))
+    win._forge_restore_save()
+
+    assert sorted(win._forge().project.written_chapters()) == [1, 2]
+    nomi = [s.name for s in fg_saves.list_saves(win.pm.paths(win.pm.active_slug()).saves)]
+    assert any("prima di riprendere" in n for n in nomi), "anche il lavoro sbagliato è recuperabile"
+    win.close()
+
+
+def test_starting_over_keeps_the_book_when_asked_to(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """«Salva e ricomincia»: la scheda torna all'intervista e il libro di prima resta ripescabile."""
+    win = MainWindow()
+    win.pm.create("Libro da riprendere da capo")
+    _forge_inline(win, monkeypatch)
+    _libro_a_meta(win)
+    monkeypatch.setattr(win, "_forge_reset_choice", lambda _forge: "salva")
+
+    win._forge_reset()
+
+    forge = win._forge()
+    assert forge.project.written_chapters() == {}, "il libro è azzerato"
+    assert forge.state.phase == "interview" and forge.state.transcript == []
+    salvataggi = fg_saves.list_saves(win.pm.paths(win.pm.active_slug()).saves)
+    assert len(salvataggi) == 1 and salvataggi[0].chapters == 2
+    assert "al sicuro" in win.fg_log.toPlainText()
+    win.close()
+
+
+def test_starting_over_throws_the_book_away_only_when_that_is_the_choice(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Cancellare è una cosa che si sceglie: annullando non si perde niente, scegliendo sì."""
+    win = MainWindow()
+    win.pm.create("Libro da buttare")
+    _forge_inline(win, monkeypatch)
+    _libro_a_meta(win)
+
+    monkeypatch.setattr(win, "_forge_reset_choice", lambda _forge: "annulla")
+    win._forge_reset()
+    assert sorted(win._forge().project.written_chapters()) == [1, 2], "annullare non tocca niente"
+
+    monkeypatch.setattr(win, "_forge_reset_choice", lambda _forge: "cancella")
+    win._forge_reset()
+
+    forge = win._forge()
+    assert forge.project.written_chapters() == {}
+    assert forge.state.phase == "interview"
+    assert fg_saves.list_saves(win.pm.paths(win.pm.active_slug()).saves) == []
+    win.close()
+
+
+def test_a_failed_save_never_leads_to_a_deletion(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """Chi sceglie «salva e ricomincia» ha chiesto di conservarlo: se il salvataggio non riesce,
+    cancellare lo stesso sarebbe l'esatto contrario di quello che ha chiesto."""
+    from PySide6.QtWidgets import QMessageBox
+
+    win = MainWindow()
+    win.pm.create("Libro che non si salva")
+    _forge_inline(win, monkeypatch)
+    _libro_a_meta(win)
+    monkeypatch.setattr(win, "_forge_reset_choice", lambda _forge: "salva")
+
+    def non_ci_riesce(*_a, **_k):
+        raise fg_saves.SaveError("il disco è pieno")
+
+    monkeypatch.setattr(fg_saves, "save_work", non_ci_riesce)
+    detto: list[str] = []
+    monkeypatch.setattr(QMessageBox, "critical",
+                        staticmethod(lambda _p, _t, testo, *a, **k: detto.append(testo)))
+
+    win._forge_reset()
+
+    assert sorted(win._forge().project.written_chapters()) == [1, 2], "non si cancella niente"
+    assert detto and "non l'ho cancellato" in detto[0]
+    win.close()
+
+
+def test_starting_over_on_an_empty_book_asks_nothing(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """Un libro mai cominciato non ha niente da perdere: la domanda sarebbe solo un ostacolo."""
+    win = MainWindow()
+    win.pm.create("Libro mai cominciato")
+    _forge_inline(win, monkeypatch)
+    win._forge().project.scaffold()  # solo cartelle vuote
+    monkeypatch.setattr(win, "_forge_reset_choice",
+                        lambda _forge: pytest.fail("non si chiede niente su un libro vuoto"))
+
+    win._forge_reset()
+
+    assert win._forge().state.phase == "interview"
+    win.close()
+
+
+# --------------------------------------------------------------------------- #
+#  «Scrivi da zero»: riquadro di stato, comandi di fase, ricerca che parte da sé
+# --------------------------------------------------------------------------- #
+def _fino_alla_specifica(win) -> None:
+    """Intervista lampo, poi alla fase della specifica."""
+    _intervista_lampo(win)
+    win._forge_advance()
+
+
+def test_the_advance_button_says_where_it_goes(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """Il testo segue la fase corrente; all'ultima il pulsante sparisce."""
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    atteso = {
+        "interview": "Passa alla specifica",
+        "spec": "Passa alla ricerca",
+        "research": "Passa alla revisione",
+        "review": "Passa alla stesura",
+        "writing": "Passa alla produzione",
+        "production": "Passa alla composizione",
+        "build": "Passa ai controlli e alla consegna",
+    }
+    forge = win._forge()
+    for fase, testo in atteso.items():
+        forge.go_to(fase)
+        win._forge_paint(forge)
+        assert win.fg_cmds["advance"].text() == testo, fase
+        assert not win.fg_cmds["advance"].isHidden(), fase
+    forge.go_to("handover")
+    win._forge_paint(forge)
+    assert win.fg_cmds["advance"].isHidden()
+    win.close()
+
+
+def test_general_commands_are_on_the_left_and_phase_commands_on_the_right(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    from PySide6.QtWidgets import QPushButton, QWidget
+
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    sinistra = win.findChild(QWidget, "fg_general_group")
+    destra = win.findChild(QWidget, "fg_phase_group")
+    assert sinistra is not None and destra is not None
+    generali = {b.text() for b in sinistra.findChildren(QPushButton)}
+    assert generali == {"Stato su disco", "Leggi la specifica", "Apri la cartella del libro",
+                        "Salva il lavoro",
+                        "Riprendi un salvataggio…", "Ricomincia da capo"}
+    for chiave, bottone in win.fg_cmds.items():
+        assert destra.isAncestorOf(bottone), chiave
+        assert not sinistra.isAncestorOf(bottone), chiave
+        assert bottone.minimumHeight() >= 44, chiave
+    # i pannelli di fase stanno anch'essi a destra
+    assert destra.isAncestorOf(win.fg_panels)
+    win.close()
+
+
+def test_command_states_follow_the_book(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """Un solo calcolo decide consigliato / disponibile / superato."""
+    from bookwriter.gui import phase_guide as pg
+
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    forge = win._forge()
+    forge.go_to("spec")
+    stati = pg.command_states(forge)
+    assert stati["spec.make"].state == pg.CONSIGLIATO
+    assert stati["spec.approve"].state == pg.SUPERATO and stati["spec.approve"].why
+    win._forge_paint(forge)
+    assert win.fg_cmds["spec.make"].property("cmd_state") == pg.CONSIGLIATO
+    assert not win.fg_cmds["spec.approve"].isEnabled()
+    assert win.fg_cmds["spec.approve"].toolTip()
+
+    _intervista_lampo(win)
+    win._forge_make_spec()
+    forge = win._forge()
+    stati = pg.command_states(forge)
+    assert stati["spec.approve"].state == pg.CONSIGLIATO
+    assert stati["spec.make"].state == pg.DISPONIBILE
+
+    forge.state.research_done = True
+    stati = pg.command_states(forge)
+    assert stati["research.decline"].state == pg.SUPERATO
+    forge.go_to("research")
+    win._forge_paint(forge)
+    assert not win.fg_cmds["research.decline"].isEnabled()
+    assert "già fatta" in win.fg_cmds["research.decline"].toolTip()
+    win.close()
+
+
+def test_command_colors_are_readable_in_both_themes() -> None:
+    from bookwriter.gui import phase_guide as pg
+
+    for tema, stati in pg.COLORS.items():
+        for stato, (sfondo, testo, bordo) in stati.items():
+            assert pg.contrast_ratio(testo, sfondo) >= 4.5, (tema, stato)
+            assert pg.contrast_ratio(bordo, sfondo) >= 1.2, (tema, stato)
+        assert pg.contrast_ratio(pg.FOCUS[tema], stati[pg.DISPONIBILE][0]) >= 3, tema
+        assert pg.contrast_ratio(pg.FOCUS[tema], stati[pg.CONSIGLIATO][0]) >= 3, tema
+
+
+def test_the_status_box_says_what_to_do_in_each_situation(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    assert win.fg_doing.text() == "Fermo, in attesa di te."
+    assert "Racconta il libro" in win.fg_todo.text()          # chat vuota
+
+    win._forge_send("Un giallo a Trieste.")
+    assert "Tocca a te" in win.fg_todo.text()                 # in attesa dell'autore
+    assert "Ho finito: decidi tu il resto" in win.fg_todo.text()
+
+    win._forge_finish_interview()
+    assert "Conversazione chiusa" in win.fg_todo.text()
+    assert "Passa alla specifica" in win.fg_todo.text()
+
+    win._forge_advance()
+    assert "Proponi la struttura" in win.fg_todo.text()
+    win._forge_make_spec()
+    assert "Approva la specifica" in win.fg_todo.text()       # specifica da approvare
+    assert win.fg_doing.text() == "Fermo, in attesa di te."
+    win.close()
+
+
+def test_the_status_box_shows_the_work_in_progress_and_clears_it(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    visto: dict[str, str] = {}
+
+    def lavoro(avanza):
+        visto["prima"] = win.fg_doing.text()
+        visto["todo"] = win.fg_todo.text()
+        win._bg_hook(1, 4)  # ciò che _run_bg fa quando arriva l'avanzamento vero
+        visto["dopo"] = win.fg_doing.text()
+        return 1
+
+    win._forge_job(lavoro, lambda r: None, "Prova…", progressable=True,
+                   activity="Sto cercando le fonti dei capitoli…",
+                   steps="Sto cercando le fonti: capitolo {0} di {1}…", kind="research")
+    assert visto["prima"].startswith("● Sto cercando le fonti dei capitoli…")
+    assert "0 s" in visto["prima"]
+    assert "Aspetta: la ricerca è in corso" in visto["todo"]
+    assert "capitolo 2 di 4" in visto["dopo"]
+    assert win.fg_doing.text() == "Fermo, in attesa di te."
+    assert win._fg_activity is None and not win._fg_timer.isActive()
+    win.close()
+
+
+def test_a_failed_job_is_told_in_the_status_box(qapp, temp_workspace: Path, monkeypatch) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    finestre: list[str] = []
+    monkeypatch.setattr(QMessageBox, "critical",
+                        staticmethod(lambda *a, **k: finestre.append(a[2])))
+
+    def guasto():
+        raise RuntimeError("Il server non risponde")
+
+    win._forge_job(guasto, lambda r: None, "Prova…", activity="Sto provando…")
+    assert "Il server non risponde" in win.fg_todo.text()
+    assert "Puoi riprovare" in win.fg_todo.text()
+    assert win.fg_doing.text() == "Fermo, in attesa di te."
+    assert finestre == ["Il server non risponde"], "la finestra c'è ancora"
+    # cambiare fase toglie l'errore
+    win._forge_go("interview")
+    assert "Il server non risponde" not in win.fg_todo.text()
+    win.close()
+
+
+def test_research_starts_by_itself_and_warns_when_the_web_is_off(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Approvata la specifica la ricerca parte da sola, anche col web spento, e lo dice."""
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    _fino_alla_specifica(win)
+    win._forge_make_spec()
+    forge = win._forge()
+    assert not forge.state.research_done
+    assert not (forge.project.research_dir / "00_landscape.md").exists()
+
+    win._forge_approve_spec()
+
+    forge = win._forge()
+    assert forge.state.phase == "research"
+    assert (forge.project.research_dir / "00_landscape.md").exists(), "il panorama"
+    for capitolo in forge.state.outline:
+        assert list(forge.project.research_dir.glob(f"{capitolo['number']:02d}_*.md")), "le fonti"
+    assert forge.state.research_done
+    assert "Il web è spento" in win.fg_todo.text()
+    assert "Ricerca finita" in win.fg_todo.text()
+    assert not win.fg_status_settings.isHidden(), "il pulsante che porta alle Impostazioni"
+    assert not win.fg_status_redo.isHidden(), "«Rifai la ricerca»"
+    # il pulsante porta alla scheda Impostazioni
+    win._forge_open_settings()
+    assert win.tabs.tabText(win.tabs.currentIndex()) == "Impostazioni"
+    win.close()
+
+
+def test_research_does_not_restart_when_it_is_already_done_or_declined(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    _fino_alla_specifica(win)
+    win._forge_make_spec()
+    win._forge_approve_spec()          # la ricerca parte e finisce
+    partenze: list[int] = []
+    monkeypatch.setattr(win, "_forge_research_all", lambda **k: partenze.append(1))
+
+    win._forge_go("spec")
+    win._forge_go("research")          # già fatta: non riparte
+    assert partenze == []
+
+    forge = win._forge()
+    forge.state.research_done = False
+    forge.state.research_declined = True
+    forge.save()
+    win._forge_go("spec")
+    win._forge_go("research")          # rinunciata: non riparte
+    assert partenze == []
+
+    forge = win._forge()
+    forge.state.research_declined = False
+    forge.save()
+    win._forge_go("spec")
+    win._forge_go("research")          # né fatta né rinunciata: riparte
+    assert partenze == [1]
+    win.close()
+
+
+def test_the_other_phases_do_not_start_by_themselves(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """Stesura e composizione chiedono scelte (stile, formati, copertina): niente avvio da soli."""
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    _fino_alla_specifica(win)
+    win._forge_make_spec()
+    win._forge_approve_spec()
+    win._forge_advance()               # alla revisione (facoltativa: non parte da sola)
+    forge = win._forge()
+    assert forge.state.phase == "review"
+    assert win._fg_activity is None
+    win._forge_advance()               # alla stesura
+    forge = win._forge()
+    assert forge.state.phase == "writing"
+    assert not forge.project.written_chapters()
+    assert win._fg_activity is None
+    win.close()
+
+
+def test_an_interrupted_research_is_not_done_and_offers_to_be_redone(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """«Fatta» = panorama e fonti di tutti i capitoli, senza interruzioni."""
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    _fino_alla_specifica(win)
+    win._forge_make_spec()
+    win._stop_requested = True           # l'autore preme «Interrompi» subito
+    win._forge_approve_spec()            # la ricerca parte da sola e si ferma
+
+    forge = win._forge()
+    assert forge.state.phase == "research"
+    assert not forge.state.research_done
+    assert not (forge.project.research_dir / "00_landscape.md").exists()
+
+    partenze: list[int] = []
+    originale = win._forge_research_all
+    monkeypatch.setattr(win, "_forge_research_all", lambda **k: partenze.append(1))
+    win._forge_go("spec")
+    win._forge_go("research")
+    assert partenze == [], "dopo un'interruzione non si riparte da soli"
+
+    monkeypatch.setattr(win, "_forge_research_all", originale)
+    win._stop_requested = False
+    win._forge_research_all()
+    assert win._forge().state.research_done
+    win.close()
+
+
+def test_the_markdown_checkbox_is_part_of_the_build(qapp, temp_workspace: Path, monkeypatch) -> None:
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    forge = win._forge()
+    _fino_alla_specifica(win)
+    win._forge_make_spec()
+    win._forge_approve_spec()
+    win._forge_decline_research()
+    win._forge_write_all()
+    win._forge_produce()
+    assert win.fg_md.text() == "Markdown (.md)" and win.fg_md.isChecked()
+    for casella in (win.fg_pdf, win.fg_docx, win.fg_epub):
+        casella.setChecked(False)
+    win._forge_build()
+    assert list(win._forge().project.out_dir.glob("*.md"))
+    win.close()
+
+
+def test_the_status_box_shows_the_section_being_written(qapp, temp_workspace: Path, monkeypatch) -> None:
+    """«Sto scrivendo il capitolo 4 di 15 · sezione 3 di 6»: da dove ripartirebbe, e dove siamo."""
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    visto: dict[str, str] = {}
+
+    def lavoro(avanza, nota):
+        win._bg_hook(3, 15)
+        nota(("section", 4, 3, 6))
+        visto["doing"] = win.fg_doing.text()
+        return None
+
+    win._forge_job(lavoro, lambda r: None, "Prova…", progressable=True,
+                   activity="Sto scrivendo i capitoli…",
+                   steps="Sto scrivendo il capitolo {0} di {1}…",
+                   on_note=lambda n: win._forge_note_detail(n))
+    assert "capitolo 4 di 15" in visto["doing"] or "capitolo 4 di" in visto["doing"]
+    assert "sezione 3 di 6" in visto["doing"]
+    win.close()
+
+
+def test_the_redo_short_command_asks_first_and_moves_chapters_aside(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    from tests.test_forge import FintoModello
+
+    win = MainWindow()
+    win.pm.create("Capitoli corti")
+    monkeypatch.setattr(win, "_client", lambda slug: FintoModello(chapters=3, words=900))
+    _forge_inline(win, monkeypatch)
+    win._refresh_forge()
+    _intervista_lampo(win)
+    win._forge_advance()
+    win._forge_make_spec()
+    win._forge_approve_spec()
+    win._forge_decline_research()
+    win._forge_write_all()
+    forge = win._forge()
+    forge.project.written_chapters()[2].write_text("# Capitolo 2: x\n\npoche parole\n",
+                                                   encoding="utf-8")
+    win._forge_paint(forge)
+    assert win.fg_cmds["writing.redo_short"].isEnabled()
+    assert "Riscrivi i capitoli troppo corti" in win.fg_todo.text()
+
+    chieste: list[str] = []
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(
+        lambda *a, **k: chieste.append(a[2]) or QMessageBox.StandardButton.No))
+    win._forge_redo_short()
+    assert chieste and "Capitolo 2" in chieste[0]
+    assert forge.short_chapters(), "con il no non si tocca niente"
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(
+        lambda *a, **k: QMessageBox.StandardButton.Yes))
+    win._forge_redo_short()
+    assert not win._forge().short_chapters()
+    assert list((forge.project.chapters_dir / ".superati").rglob("*.md"))
+    win.close()
+
+
+# --------------------------------------------------------------------------- #
+#  Parte B: l'esploratore della ricerca e la chat delle questioni aperte
+# --------------------------------------------------------------------------- #
+def _libro_con_ricerca(win, monkeypatch, *, web: bool = True, risolve: str = "mai"):
+    """Un libro arrivato alla fase Ricerca, con la ricerca fatta (modello e rete finti)."""
+    from bookwriter.forge import research as rs
+    from bookwriter.forge.websearch import Page, SearchResult
+    from tests.test_research_depth import FintoRicerca
+
+    win.pm.create("Esploratore")
+    slug = win.pm.active_slug()
+    cfg = win.pm.config_for(slug)
+    cfg.research.enabled = web
+    win.pm.save_config_for(slug, cfg)
+    modello = FintoRicerca()
+    modello.risolve_se = risolve
+    modello.giri = [["a"], ["b"], ["c"]]
+    monkeypatch.setattr(win, "_client", lambda s: modello)
+    _forge_inline(win, monkeypatch)
+
+    def gather(query, settings, *, read=None, page=0, skip=None):
+        s = "-".join(query.lower().split())[:40]
+        return ([SearchResult(f"Titolo {s}", f"https://esempio.org/{s}", "estratto")],
+                [Page(f"https://esempio.org/{s}", f"Pagina {s}", f"Testo di {query}")])
+
+    monkeypatch.setattr(rs, "gather", gather)
+    win._refresh_forge()
+    _intervista_lampo(win)
+    win._forge_advance()
+    win._forge_make_spec()
+    win._forge_approve_spec()      # la ricerca parte da sola
+    return modello
+
+
+def _questioni(win):
+    forge = win._forge()
+    return forge, forge.pending_questions()
+
+
+def test_the_explorer_has_three_tabs_and_a_tab_per_chapter(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    win = MainWindow()
+    _libro_con_ricerca(win, monkeypatch)
+    forge = win._forge()
+    assert win.fg_center.currentWidget() is win.fg_explorer
+    tabs = win.fg_explorer.tabs
+    assert [tabs.tabText(i).split(" (")[0] for i in range(3)] == [
+        "Cosa esiste già", "Fonti dei capitoli", "Questioni aperte"]
+    assert win.fg_explorer.chapters_tabs.count() == len(forge.state.outline)
+    pagina = win.fg_explorer.page(1)
+    assert len(pagina.boxes) == len(forge.state.outline[0]["points"])
+    assert "Scena 1 del capitolo 1" in pagina.boxes[0].title()
+    assert pagina.boxes[0].rows, "risultati e pagine lette del punto"
+    assert "Un libro che c'è" in win.fg_explorer.landscape_view.toPlainText()
+    # le questioni da decidere sono nel titolo della terza scheda e nel riquadro di stato
+    assert "(" in tabs.tabText(2)
+    assert not win.fg_status_questions.isHidden()
+    assert "contrasti da discutere" in win.fg_todo.text()
+    win.close()
+
+
+def test_include_and_extend_work_from_the_explorer(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    from bookwriter.forge import research as rs
+    from bookwriter.forge import research_store as store
+    from bookwriter.forge.websearch import Page
+
+    win = MainWindow()
+    _libro_con_ricerca(win, monkeypatch)
+    forge = win._forge()
+    dati = forge.chapter_data(1)
+    nuovo = "https://altro.org/non-letto"
+    dati.points[0].results.append(store.Hit("Non letto", nuovo, "solo l'estratto"))
+    store.save_chapter(forge.project.research_dir, dati)
+    monkeypatch.setattr(rs, "fetch", lambda url, settings: Page(url, "Letto ora", "Testo intero"))
+    win._forge_explorer_refresh()
+
+    riga = next(r for r in win.fg_explorer.page(1).boxes[0].rows if r.url == nuovo)
+    assert riga.include is not None and riga.include.isEnabled()
+    assert riga.state.text() == "non letta"
+    riga.include.click()
+    assert nuovo in win._forge().chapter_data(1).points[0].read_urls()
+    riga = next(r for r in win.fg_explorer.page(1).boxes[0].rows if r.url == nuovo)
+    assert riga.include is None and riga.state.text() == "letta"
+    assert riga.read_button is not None
+    assert riga.excerpt.toPlainText() == "Testo intero"
+
+    prima = len(win._forge().chapter_data(1).points[0].results)
+    win.fg_explorer.page(1).boxes[0].extend.click()
+    assert len(win._forge().chapter_data(1).points[0].results) > prima
+    win.close()
+
+
+def test_the_explorer_commands_are_off_with_the_web_off_and_say_why(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    win = MainWindow()
+    _libro_con_ricerca(win, monkeypatch)
+    monkeypatch.setattr(win, "_forge_web_on", lambda: False)
+    win._forge_explorer_refresh()
+    pagina = win.fg_explorer.page(1)
+    assert not pagina.boxes[0].extend.isEnabled()
+    assert "spenta" in pagina.boxes[0].extend.toolTip()
+    assert pagina.boxes[0].extend.minimumHeight() >= 44
+    for r in [r for b in pagina.boxes for r in b.rows if r.include is not None]:
+        assert not r.include.isEnabled() and "spenta" in r.include.toolTip()
+    win.close()
+
+
+def test_the_questions_chat_lists_the_pending_questions_first(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    win = MainWindow()
+    _libro_con_ricerca(win, monkeypatch)
+    forge, aperte = _questioni(win)
+    assert aperte
+    prima = win.fg_explorer.questions.view.bubbles()[0].text
+    assert "contrasti" in prima and aperte[0].text in prima
+    assert "resta come l'hai scritto" in prima or "restano come li hai scritti" in prima
+    assert aperte[0].text in win.fg_explorer.questions.notebook.toPlainText()
+    assert win.fg_explorer.questions.composer.attach is not None
+    win.close()
+
+
+def test_a_pasted_url_in_the_chat_resolves_a_question(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    from bookwriter.forge import questions as qs
+    from bookwriter.forge.websearch import Page
+
+    win = MainWindow()
+    modello = _libro_con_ricerca(win, monkeypatch)
+    modello.risolve_se = "archivio"
+    monkeypatch.setattr(qs, "fetch", lambda url, settings: Page(url, "Archivio", "Testo."))
+    prima = len(_questioni(win)[1])
+
+    win._questions_send("Guarda https://esempio.gov/archivio per favore.")
+
+    forge, dopo = _questioni(win)
+    assert len(dopo) < prima
+    assert any(q.status == "risolta" for q in forge.questions())
+    chat = win.fg_explorer.questions
+    assert [b.role for b in chat.view.bubbles()][-2:] == ["user", "assistant"]
+    assert win._qchat_busy is False
+    win.close()
+
+
+def test_an_attached_document_in_the_chat_resolves_a_question(
+    qapp, temp_workspace: Path, monkeypatch, tmp_path: Path,
+) -> None:
+    win = MainWindow()
+    modello = _libro_con_ricerca(win, monkeypatch)
+    modello.risolve_se = "nota"
+    documento = tmp_path / "nota.txt"
+    documento.write_text("Le vittime furono dodici, dall'archivio di stato del 1978.",
+                         encoding="utf-8")
+    composer = win.fg_explorer.questions.composer
+    composer.add_attachments([documento])
+    assert "nota.txt" in composer.attached_label.text() and not composer.attached_row.isHidden()
+    prima = len(_questioni(win)[1])
+
+    win._questions_send("")          # solo l'allegato, nessun testo
+
+    forge, dopo = _questioni(win)
+    assert len(dopo) < prima
+    assert composer.take_attachments() == [], "gli allegati partono e si svuotano"
+    utente = [b for b in win.fg_explorer.questions.view.bubbles() if b.role == "user"][-1]
+    assert "nota.txt" in utente.text
+    win.close()
+
+
+def test_publish_and_omit_decisions_made_in_the_chat_are_recorded(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    win = MainWindow()
+    modello = _libro_con_ricerca(win, monkeypatch)
+    forge, aperte = _questioni(win)
+    primo = aperte[0]
+    modello.decisioni = [{"question_id": primo.id, "action": "publish",
+                          "text": "Secondo la tradizione, le vittime furono molte."}]
+
+    win._questions_send("Va bene la tua formulazione.")
+
+    forge = win._forge()
+    q = next(x for x in forge.questions() if x.id == primo.id)
+    assert q.status == "decisa" and q.outcome["kind"] == "publish"
+    assert "Secondo la tradizione" in q.outcome["text"]
+    assert "si pubblica così" in win.fg_explorer.questions.notebook.toPlainText()
+
+    ancora = forge.pending_questions()
+    if ancora:
+        modello.decisioni = [{"question_id": ancora[0].id, "action": "omit", "text": ""}]
+        win._questions_send("Questa tralasciamola.")
+        omessa = next(x for x in win._forge().questions() if x.id == ancora[0].id)
+        assert omessa.status == "decisa" and omessa.outcome["kind"] == "omit"
+    # la stesura riceve le decisioni
+    capitolo = next(c for c in forge.state.outline if int(c["number"]) == primo.chapter)
+    assert "scrivi così" in win._forge()._decisions_for(capitolo)
+    win.close()
+
+
+def test_a_url_with_the_web_off_is_said_in_the_chat(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    from PySide6.QtWidgets import QLabel
+
+    from bookwriter.gui.chat import Notice
+
+    win = MainWindow()
+    _libro_con_ricerca(win, monkeypatch)
+    monkeypatch.setattr(win, "_forge_web_on", lambda: False)
+    slug = win.pm.active_slug()
+    cfg = win.pm.config_for(slug)
+    cfg.research.enabled = False
+    win.pm.save_config_for(slug, cfg)
+    win._questions_send("Vedi https://esempio.gov/x")
+    testi = [" ".join(label.text() for label in n.findChildren(QLabel))
+             for n in win.fg_explorer.questions.view.findChildren(Notice)]
+    assert any("spenta" in testo for testo in testi), testi
+    win.close()
+
+
+def test_chapter_sub_tabs_carry_number_and_short_title(qapp, temp_workspace: Path, monkeypatch) -> None:
+    from bookwriter.gui.research_view import ResearchExplorer
+
+    explorer = ResearchExplorer()
+    outline = [{"number": 1, "title": "Il porto"},
+               {"number": 2, "title": "Un titolo davvero molto molto lungo per una scheda"}]
+    explorer.set_data(None, outline, [], web_on=False)
+    tabs = explorer.chapters_tabs
+    assert tabs.tabText(0) == "1 · Il porto"
+    assert tabs.tabText(1).startswith("2 · Un titolo") and tabs.tabText(1).endswith("…")
+    assert len(tabs.tabText(1)) <= 28
+    assert "molto lungo per una scheda" in tabs.tabToolTip(1)
+
+
+def test_the_questions_intro_uses_correct_singular_and_plural(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    from bookwriter.forge import research_store as store
+
+    win = MainWindow()
+    win.pm.create("Plurali")
+    uno = store.Question("a", "Una cifra", 1, 0, store.CHIESTA, [store.Attempt(1, ["x"], 1, 1)])
+    molte = store.Question("b", "Un'altra", 1, 0, store.CHIESTA, [store.Attempt(1, ["x", "y"], 5, 3)])
+    testo = win._questions_intro([uno, molte])
+    assert "provato con 1 interrogazione, 1 risultato visto." in testo
+    assert "provato con 2 interrogazioni, 5 risultati visti." in testo
+    assert "1 interrogazioni" not in testo and "1 risultati" not in testo
+    win.close()
+
+
+def test_the_composer_placeholder_is_readable_in_both_themes(qapp) -> None:
+    from PySide6.QtGui import QColor, QPalette
+
+    from bookwriter.gui import phase_guide as pg
+    from bookwriter.gui.chat import Composer, muted_color
+
+    anteriore = QApplication.palette()
+    try:
+        for fondo, testo in (("#ffffff", "#202124"), ("#17181a", "#e8eaed")):
+            p = QPalette()
+            p.setColor(QPalette.ColorRole.Base, QColor(fondo))
+            p.setColor(QPalette.ColorRole.Text, QColor(testo))
+            QApplication.setPalette(p)
+            composer = Composer()
+            colore = muted_color(composer)           # «rgb(r,g,b)»
+            r, g, b = (int(x) for x in colore[4:-1].split(","))
+            assert pg.contrast_ratio(f"#{r:02x}{g:02x}{b:02x}", fondo) >= 4.5, (fondo, colore)
+            assert "placeholder-text-color" in composer.input.styleSheet()
+    finally:
+        QApplication.setPalette(anteriore)
+
+
+def test_entering_research_with_the_old_format_redoes_it_from_scratch(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Il caso vero: una ricerca fatta nel formato di prima (solo .md) si rifà entrando in Ricerca."""
+    win = MainWindow()
+    _libro_con_ricerca(win, monkeypatch)
+    forge = win._forge()
+    rd = forge.project.research_dir
+    for json_file in rd.glob("*.json"):
+        json_file.unlink()                       # com'era prima: restano i .md
+    assert forge.research_format_old()
+    win._forge_go("spec")
+    win._forge_go("research")                    # parte da sola, anche se «fatta»
+
+    forge = win._forge()
+    assert forge.landscape_data() is not None, "anche il panorama, che era solo .md"
+    assert forge.chapter_data(1) is not None and forge.state.research_done
+    assert not forge.research_format_old()
+    win.close()
+
+
+def test_a_new_structure_reuses_the_landscape_and_redoes_only_the_chapter_research(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    from bookwriter.forge.engine import Forge
+
+    win = MainWindow()
+    _libro_con_ricerca(win, monkeypatch)
+    forge = win._forge()
+    assert forge.state.research_done
+    testo = forge.project.spec_path.read_text(encoding="utf-8").replace(
+        "Il passaggio 2", "Un secondo capitolo diverso")
+    forge.save_spec(testo)
+    assert not win._forge().state.research_done
+
+    chiamate: list[int] = []
+    originale = Forge.research_landscape
+
+    def conta(self, **k):
+        chiamate.append(1)
+        return originale(self, **k)
+
+    monkeypatch.setattr(Forge, "research_landscape", conta)
+    win._forge_go("spec")
+    win._forge_go("research")
+
+    forge = win._forge()
+    assert chiamate == [], "il panorama c'è già: non si rifà"
+    assert forge.state.research_done
+    assert forge.chapter_data(2) is not None and forge.state.outline[1]["title"] == "Un secondo capitolo diverso"
     win.close()

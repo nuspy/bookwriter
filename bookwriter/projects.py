@@ -44,6 +44,25 @@ class ProjectPaths:
         return self.root / "exports"
 
     @property
+    def book(self) -> Path:
+        """Il libro in lavorazione: specifica, capitoli, ricerca, produzione.
+
+        È una cartella e non una tabella perché un libro dura più sessioni e più programmi: chi
+        riprende il lavoro domani, o con un altro assistente, deve trovare tutto leggibile
+        com'è. Vedi ``bookwriter.forge``.
+        """
+        return self.root / "book"
+
+    @property
+    def saves(self) -> Path:
+        """I libri messi da parte: uno zip per salvataggio. Vedi ``bookwriter.forge.saves``.
+
+        Stanno accanto al libro e non dentro, perché quella cartella si azzera: un salvataggio
+        che sparisse insieme al lavoro che protegge non servirebbe a niente.
+        """
+        return self.root / "saves"
+
+    @property
     def config(self) -> Path:
         return self.root / CONFIG_FILENAME
 

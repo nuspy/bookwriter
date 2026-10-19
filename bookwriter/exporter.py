@@ -1,8 +1,15 @@
-"""Resa ed export: Markdown, DOCX (Pandoc), PDF (reportlab) e wiki/archivio (HTML + JSON).
+"""Resa ed export: Markdown, DOCX, PDF, EPUB e wiki/archivio (HTML + JSON).
 
-``write_output`` è il punto unico usato da tutte le modalità per scrivere md/docx/pdf.
-``export_wiki`` produce l'archivio navigabile dei nodi e del grafo (uso "archivio" invece di "libro").
-Nessuna dipendenza di sistema: DOCX via ``pypandoc-binary``, PDF via ``reportlab``.
+``write_output`` è il punto unico usato da tutte le modalità per scrivere un libro, e da qui in
+avanti passa dal compositore di ``bookwriter.forge``: lo stesso che impagina i libri delle sette
+fasi. Non è un dettaglio di implementazione — vuol dire che una bozza esportata dalla schermata
+di composizione, una riscrittura e una traduzione escono con la stessa cura tipografica di un
+libro preparato per la stampa: misura reale invece dell'A4, margini asimmetrici che tengono conto
+della piega, sillabazione, capitoli che aprono in recto, indice, titoli correnti, e la
+bibliografia dei capitoli raccolta in una sola in fondo.
+
+``export_wiki`` produce l'archivio navigabile dei nodi e del grafo (uso "archivio" invece di
+"libro"). Nessuna dipendenza di sistema: tutto in Python.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from bookwriter.db.project_schema import (
     OutlineSection,
     make_engine,
 )
+from bookwriter.forge.compose import SUPPORTED_FORMATS, Composed, compose_markdown
 
 
 def latest_outline_id(db_path: Path) -> int | None:
@@ -78,75 +86,51 @@ def outline_to_markdown(db_path: Path, outline_id: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
-#  scrittura output (md / docx / pdf)
+#  scrittura output (md / docx / pdf / epub)
 # --------------------------------------------------------------------------- #
-def markdown_to_pdf(markdown: str, out_path: Path) -> Path:
-    """Genera un PDF impaginato dal Markdown (titolo #, capitoli ##, paragrafi). Puro Python."""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import cm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+def compose_output(
+    markdown: str,
+    out_path: Path,
+    fmt: str,
+    *,
+    title: str = "",
+    author: str = "",
+    language: str = "it",
+    production=None,
+    cover: Path | None = None,
+) -> Composed:
+    """Compone il libro e racconta cos'è uscito (pagine, capitoli, caratteri usati).
 
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("BookTitle", parent=styles["Title"], fontSize=24, spaceAfter=20)
-    h2 = ParagraphStyle("Chapter", parent=styles["Heading1"], fontSize=16, spaceBefore=18, spaceAfter=10)
-    h3 = ParagraphStyle("Sub", parent=styles["Heading2"], fontSize=13, spaceBefore=10)
-    body = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=11, leading=16, spaceAfter=8, alignment=4)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    doc = SimpleDocTemplate(
-        str(out_path), pagesize=A4, topMargin=2 * cm, bottomMargin=2 * cm, leftMargin=2.2 * cm, rightMargin=2.2 * cm
+    ``production`` è una ``ProductionSettings``: misura del taglio, caratteri, sillabazione,
+    marchio. Senza, valgono i valori di serie del compositore — A5, il primo carattere con vere
+    corsive che trova sulla macchina, sillabazione dalla lingua.
+    """
+    if fmt not in SUPPORTED_FORMATS:
+        raise ValueError(f"Formato non supportato: {fmt} (usa {'|'.join(SUPPORTED_FORMATS)})")
+    return compose_markdown(
+        markdown, Path(out_path), fmt,
+        title=title,
+        author=author or (getattr(production, "author", "") or ""),
+        language=language or "it",
+        trim=getattr(production, "trim", "a5") or "a5",
+        cover=cover,
+        overrides=production.overrides() if production is not None else None,
     )
-    flow: list = []
-    para: list[str] = []
-
-    def flush() -> None:
-        if para:
-            text = " ".join(para).strip()
-            if text:
-                flow.append(Paragraph(_html.escape(text), body))
-            para.clear()
-
-    for raw in markdown.splitlines():
-        line = raw.rstrip()
-        if line.startswith("# "):
-            flush()
-            flow.append(Paragraph(_html.escape(line[2:].strip()), title_style))
-            flow.append(Spacer(1, 12))
-        elif line.startswith("## "):
-            flush()
-            flow.append(Paragraph(_html.escape(line[3:].strip()), h2))
-        elif line.startswith("### "):
-            flush()
-            flow.append(Paragraph(_html.escape(line[4:].strip()), h3))
-        elif not line.strip():
-            flush()
-        else:
-            para.append(line.strip())
-    flush()
-    doc.build(flow or [Spacer(1, 1)])
-    return out_path
 
 
-def write_output(markdown: str, out_path: Path, fmt: str) -> Path:
-    """Scrive il Markdown nel formato richiesto: ``md`` | ``docx`` | ``pdf``."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if fmt == "md":
-        out_path.write_text(markdown, encoding="utf-8")
-    elif fmt == "docx":
-        import pypandoc
-
-        pypandoc.convert_text(markdown, "docx", format="markdown", outputfile=str(out_path))
-    elif fmt == "pdf":
-        markdown_to_pdf(markdown, out_path)
-    else:
-        raise ValueError(f"Formato non supportato: {fmt} (usa md|docx|pdf)")
-    return out_path
+def write_output(markdown: str, out_path: Path, fmt: str, **kwargs) -> Path:
+    """Scrive il Markdown nel formato richiesto: ``md`` | ``docx`` | ``pdf`` | ``epub``."""
+    return compose_output(markdown, Path(out_path), fmt, **kwargs).path
 
 
-def export_outline(db_path: Path, outline_id: int, out_path: Path, fmt: str = "md") -> Path:
-    """Esporta l'outline (resa verbatim) in md/docx/pdf."""
-    return write_output(outline_to_markdown(db_path, outline_id), out_path, fmt)
+def markdown_to_pdf(markdown: str, out_path: Path, **kwargs) -> Path:
+    """PDF impaginato dal Markdown. Scorciatoia storica per ``write_output(..., "pdf")``."""
+    return write_output(markdown, Path(out_path), "pdf", **kwargs)
+
+
+def export_outline(db_path: Path, outline_id: int, out_path: Path, fmt: str = "md", **kwargs) -> Path:
+    """Esporta l'outline (resa verbatim) in md/docx/pdf/epub."""
+    return write_output(outline_to_markdown(db_path, outline_id), out_path, fmt, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
