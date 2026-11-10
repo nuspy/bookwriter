@@ -30,3 +30,6 @@ node_modules/
 tools/trawl/node_modules/
 tools/trawl/**/node_modules/
 tools/trawl/.env
+
+# Logs
+*.log
