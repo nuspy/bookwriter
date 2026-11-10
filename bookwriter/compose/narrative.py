@@ -4,6 +4,10 @@ Per ogni capitolo dell'outline genera **prosa nuova** che intreccia i nodi (fram
 stile scelto (StyleContract), rispettando un **budget di parole** ripartito dal `BookSpec`. Uno stato
 di continuità (glossario, riassunto, coda) mantiene uniforme lo stile tra i capitoli. Una
 **riconciliazione** avvicina ogni capitolo al suo budget. Persistente e riavviabile.
+
+Se la struttura è nata da uno scopo e da un lettore dichiarati (:mod:`bookwriter.organize.purpose`),
+ogni capitolo viene scritto sapendo a cosa serve: scopo del libro, lettore, obiettivo del capitolo
+e frase di passaggio dal precedente entrano nelle istruzioni. Le altre strutture non cambiano.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from bookwriter.db.project_schema import (
     ensure_columns,
     make_engine,
 )
+from bookwriter.organize.purpose import chapter_guidance
 from bookwriter.text_utils import split_sentences
 
 COMPOSE_SCHEMA: dict[str, Any] = {
@@ -129,6 +134,29 @@ def _split_list(items: list, k: int) -> list[list]:
     return [items[round(i * n / k) : round((i + 1) * n / k)] for i in range(k) if items[round(i * n / k) : round((i + 1) * n / k)]]
 
 
+def guidance_note(guide: dict, chapter: dict) -> str:
+    """Istruzione con scopo, lettore, obiettivo e transizione del capitolo; ``""`` senza piano."""
+    if not guide:
+        return ""
+    entry = (
+        guide.get("by_id", {}).get(chapter.get("id"))
+        or guide.get("by_title", {}).get(chapter.get("title", ""))
+        or {}
+    )
+    lines = [(
+        f"Il libro ha questo scopo: {guide.get('purpose', '')}. È scritto per questo lettore: "
+        f"{guide.get('reader', '')}. Scegli spiegazioni, esempi e lessico adatti a lui."
+    )]
+    if entry.get("goal"):
+        lines.append(f"Questo capitolo deve ottenere: {entry['goal']}.")
+    if entry.get("transition"):
+        lines.append(
+            "Passaggio previsto dal capitolo precedente (usalo come avvio, adattandolo): "
+            f"{entry['transition']}"
+        )
+    return " ".join(lines)
+
+
 def _generate_chapter(
     title: str,
     materials: list[str],
@@ -141,6 +169,7 @@ def _generate_chapter(
     adjust_note: str | None = None,
     language: str = "",
     fidelity: str = FIDELITY_FREE,
+    guidance: str = "",
     on_part=None,
 ) -> tuple[str, dict, int]:
     """Genera un capitolo; se il budget è grande lo produce in più parti sequenziali."""
@@ -151,6 +180,7 @@ def _generate_chapter(
         risultato = _generate_part(
             title, materials, budget, contract, continuity, client,
             model=model, adjust_note=adjust_note, language=language, fidelity=fidelity,
+            guidance=guidance,
         )
         if on_part:
             on_part()
@@ -170,6 +200,7 @@ def _generate_chapter(
         text, continuity, words = _generate_part(
             title, group, part_budget, contract, continuity, client,
             model=model, adjust_note=note, language=language, fidelity=fidelity,
+            guidance=guidance,
         )
         texts.append(text)
         total_words += words
@@ -190,6 +221,7 @@ def _generate_part(
     adjust_note: str | None = None,
     language: str = "",
     fidelity: str = FIDELITY_FREE,
+    guidance: str = "",
 ) -> tuple[str, dict, int]:
     mat = "\n".join(f"- {m}" for m in materials if m.strip())
     fedele = fidelity == FIDELITY_FAITHFUL
@@ -214,6 +246,8 @@ def _generate_part(
         )
     if any(m.startswith("[Sezione:") for m in materials):
         instruction += " Se compaiono righe '[Sezione: X]', organizza la prosa in sotto-sezioni con intestazione Markdown '### X'."
+    if guidance:
+        instruction += " " + guidance
     if adjust_note:
         instruction += " " + adjust_note
     instruction += (
@@ -312,8 +346,12 @@ def compose_outline(
     ensure_columns(engine, ComposedChapter)
     # Stile, lunghezza e lingua identificano la stesura: se cambiano, riusare i capitoli
     # già scritti darebbe lo stesso libro di prima con un nome diverso.
+    # Il piano (scopo, lettore, obiettivi) entra nell'impronta solo se c'è: le strutture senza
+    # piano conservano l'impronta di prima e i capitoli già scritti restano validi.
+    guide = chapter_guidance(db_path, outline_id)
+    plan_mark = f"|{sorted(guide['by_title'].items())}|{guide['purpose']}|{guide['reader']}" if guide else ""
     signature = hashlib.sha256(
-        f"{contract}|{target_words}|{tolerance_pct}|{language}|{fidelity}".encode()
+        f"{contract}|{target_words}|{tolerance_pct}|{language}|{fidelity}{plan_mark}".encode()
     ).hexdigest()[:16]
     if not resume:
         with Session(engine) as ses:
@@ -349,9 +387,11 @@ def compose_outline(
             for _ in range(estimated_parts(budget, ch["materials"])):
                 _part_done()
             continue
+        guidance = guidance_note(guide, ch)
         text, continuity, words = _generate_chapter(
             ch["title"], ch["materials"], budget, contract, continuity, client,
-            model=model, language=language, fidelity=fidelity, on_part=_part_done,
+            model=model, language=language, fidelity=fidelity, guidance=guidance,
+            on_part=_part_done,
         )
         # Riconciliazione: si insiste finché il capitolo rientra nella tolleranza. Un solo
         # tentativo non basta, perché i modelli tendono sistematicamente a scrivere meno.
@@ -369,7 +409,7 @@ def compose_outline(
             candidate, candidate_continuity, candidate_words = _generate_chapter(
                 ch["title"], ch["materials"], budget, contract, continuity, client,
                 model=model, adjust_note=note, language=language, fidelity=fidelity,
-                on_part=_part_done,
+                guidance=guidance, on_part=_part_done,
             )
             # Si tiene il tentativo solo se avvicina davvero il bersaglio.
             if abs(candidate_words - budget) < abs(words - budget):

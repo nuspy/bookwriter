@@ -156,6 +156,7 @@ def test_interrupting_stops_inside_the_book_and_keeps_what_was_done(tmp_path: Pa
     ripresa = rewrite_document(
         db, coda[0].document_id, "", cliente, mode="translate",
         target_language="inglese", critic=False,
+        literary=False,  # si contano le sole traduzioni, non i passaggi letterari accessori
     )
     assert ripresa.status == "done"
     assert cliente.chiamate - prima < 3, "ha ripreso da dove era, non da capo"

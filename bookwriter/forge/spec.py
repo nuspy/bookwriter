@@ -214,16 +214,35 @@ def propose_outline(
               "Decidi tu quanti capitoli servono: di norma fra 8 e 30, secondo la forma e la "
               "lunghezza. Le parti servono solo se i capitoli superano gli otto o se il libro ha "
               "movimenti distinti.")
+    if nb.is_narrative(state):
+        # Un romanzo non «stabilisce» tesi: un capitolo fatto di tesi diventa un saggio, e ogni
+        # tesi, data da scrivere a una sezione, si ripete fino a riempirla (*The Red Thread*).
+        funzione = (
+            "Sei un editor che progetta la struttura di un romanzo. Dai una struttura in cui ogni "
+            "capitolo ha UNA funzione nel racconto e la dice in una riga: cosa cambia per il "
+            "protagonista (cosa scopre, cosa perde, cosa decide, quale pericolo cresce), non una "
+            "tesi da dimostrare. "
+            "Di ogni capitolo dai anche da 3 a 6 PUNTI CHIAVE: gli eventi e le scene che il "
+            "capitolo porta, nell'ordine in cui accadono, ciascuno in una riga concreta — chi fa "
+            "cosa, dove, con quale conseguenza (non «X è presentato come fatto storico», ma la "
+            "scena in cui il protagonista ne trova la prova e cosa ne fa). Un episodio storico è "
+            "un punto come gli altri, e si racconta come scena. Sono la base su cui si cercano le "
+            "fonti e si scrive. "
+        )
+    else:
+        funzione = (
+            "Sei un editor che progetta la struttura di un libro. Dai una struttura in cui ogni "
+            "capitolo fa UNA cosa sola e la dice in una riga: non un titolo generico, ma quello "
+            "che il capitolo stabilisce e che i successivi possono dare per acquisito. "
+            "Di ogni capitolo dai anche da 3 a 6 PUNTI CHIAVE: le scene, i passaggi o gli "
+            "argomenti che il capitolo deve portare, nell'ordine in cui compaiono, ciascuno in "
+            "una riga concreta (non «introduzione» ma quello che l'introduzione stabilisce). Sono "
+            "la base su cui si cercano le fonti e si scrive: ogni punto deve poter essere "
+            "documentato o scritto da solo. "
+        )
     sistema = (
-        "Sei un editor che progetta la struttura di un libro. Dai una struttura in cui ogni "
-        "capitolo fa UNA cosa sola e la dice in una riga: non un titolo generico, ma quello che "
-        "il capitolo stabilisce e che i successivi possono dare per acquisito. "
-        "Di ogni capitolo dai anche da 3 a 6 PUNTI CHIAVE: le scene, i passaggi o gli argomenti "
-        "che il capitolo deve portare, nell'ordine in cui compaiono, ciascuno in una riga "
-        "concreta (non «introduzione» ma quello che l'introduzione stabilisce). Sono la base su "
-        "cui si cercano le fonti e si scrive: ogni punto deve poter essere documentato o "
-        "scritto da solo. "
-        f"{quanti} "
+        funzione
+        + f"{quanti} "
         f"{misura}"
         + (f"Il budget totale è di {parole} parole: distribuiscilo fra i capitoli in modo che la "
            "somma ci arrivi vicino, dando più spazio dove c'è più da dimostrare e meno alle "

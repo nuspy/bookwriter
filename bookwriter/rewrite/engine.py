@@ -8,6 +8,8 @@ chunk in chunk: glossario coerente (nomi/termini), riassunto progressivo, coda d
 
 from __future__ import annotations
 
+import copy
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -22,6 +24,21 @@ from bookwriter.db.project_schema import (
     make_engine,
 )
 from bookwriter.llm.client import LLMDegenerate, LLMError
+from bookwriter.rewrite.literary import (
+    DECISA,
+    FORM_KEEP,
+    FORM_PROSE_FROM_VERSE,
+    FORMS,
+    espansione,
+    interpreta_scelta,
+    istruzioni_di_forma,
+    nota_per_il_giudice,
+    registra_idiomi,
+    rifinisci,
+    testo_delle_scelte,
+    trova_idiomi,
+    unita_di_lavoro,
+)
 from bookwriter.text_utils import has_prose, split_sentences
 
 REWRITE_SCHEMA: dict[str, Any] = {
@@ -70,6 +87,13 @@ class RewriteReport:
     stalled: int = 0  # passaggi su cui il modello è entrato in ripetizione
     salvaged: int = 0  # passaggi recuperati riprovandoli divisi in due
     stopped: bool = False  # interrotto su richiesta: il lavoro fatto è salvato e riprende da lì
+    polished: int = 0  # passaggi migliorati dalla rifinitura madrelingua
+    polish_kept: int = 0  # passaggi in cui la rifinitura è stata scartata o non è riuscita
+    idioms_asked: int = 0  # domande fatte all'utente su modi di dire e riferimenti culturali
+    idioms_pending: int = 0  # voci ancora «non decise» nel registro della lavorazione
+    style_source: str = ""  # da dove viene lo stile usato (estratto dall'originale, scelto…)
+    form: str = FORM_KEEP  # forma del testo prodotto (keep | prose_from_verse)
+    modernized: bool = False  # lingua modernizzata conservando la voce dell'autore
 
     def summary(self) -> str:
         base = f"run #{self.run_id}: elaborati {self.processed}/{self.total} chunk ({self.status})"
@@ -86,6 +110,20 @@ class RewriteReport:
             )
         if self.unchecked:
             base += f" · {self.unchecked} senza controllo di stile (il giudice non ha risposto)"
+        if self.style_source:
+            base += f" · stile: {self.style_source}"
+        if self.form == FORM_PROSE_FROM_VERSE:
+            base += " · dai versi alla prosa"
+        if self.modernized:
+            base += " · lingua modernizzata"
+        if self.polished or self.polish_kept:
+            base += f" · rifinitura madrelingua: {self.polished} brani rifiniti"
+            if self.polish_kept:
+                base += f", {self.polish_kept} lasciati com'erano"
+        if self.idioms_asked:
+            base += f" · {self.idioms_asked} modi di dire sottoposti alla tua scelta"
+        if self.idioms_pending:
+            base += f" · {self.idioms_pending} modi di dire in attesa di una tua decisione"
         return base
 
 
@@ -104,7 +142,14 @@ def _continuity_text(continuity: dict) -> str:
     return "\n".join(lines)
 
 
-def _instruction(mode: str, target_language: str | None, ratio: float | None) -> str:
+def _instruction(
+    mode: str,
+    target_language: str | None,
+    ratio: float | None,
+    *,
+    form: str = FORM_KEEP,
+    modernize: bool = False,
+) -> str:
     if mode == "translate":
         base = f"Traduci il testo in {target_language}, mantenendo lo stile descritto e il contenuto."
     else:
@@ -112,13 +157,19 @@ def _instruction(mode: str, target_language: str | None, ratio: float | None) ->
     base += " Usa il glossario per la coerenza di nomi e termini. Assicura continuità con le ultime frasi."
     if ratio:
         base += f" Punta a circa {round(ratio * 100)}% della lunghezza originale."
-    base += (
-        " CONSERVA L'IMPAGINAZIONE: restituisci lo stesso numero di paragrafi dell'originale, "
-        "nello stesso ordine, separati da una riga vuota. Un paragrafo che comincia con dei "
-        "cancelletti (## …) è un titolo: lascia i cancelletti dove sono ed elabora solo il titolo. "
-        "Gli asterischi (*corsivo*, **grassetto**) sono formattazione del libro: vanno riportati "
-        "sulle parole corrispondenti."
-    )
+    if form == FORM_KEEP:
+        base += (
+            " CONSERVA L'IMPAGINAZIONE: restituisci lo stesso numero di paragrafi dell'originale, "
+            "nello stesso ordine, separati da una riga vuota. Un paragrafo che comincia con dei "
+            "cancelletti (## …) è un titolo: lascia i cancelletti dove sono ed elabora solo il titolo. "
+            "Gli asterischi (*corsivo*, **grassetto**) sono formattazione del libro: vanno riportati "
+            "sulle parole corrispondenti."
+        )
+    # Con la prosa dai versi il numero dei paragrafi smette di essere un vincolo: lo sostituisce
+    # la conservazione dei soli titoli (capitoli, canti), che è quella che conta per il libro.
+    trasformazioni = istruzioni_di_forma(mode, target_language, form=form, modernize=modernize)
+    if trasformazioni:
+        base += " " + trasformazioni
     base += (
         " Rispondi in JSON: 'rewritten' (il testo), 'glossary' (nuovi nomi/termini con la resa scelta), "
         "'summary' (riassunto cumulativo aggiornato, incluso questo brano)."
@@ -179,8 +230,20 @@ def _rewrite_one(
     model: str | None,
     critic: bool = True,
     critic_model: str | None = None,
+    form: str = FORM_KEEP,
+    modernize: bool = False,
+    vincoli: str = "",
 ) -> tuple[str, dict, bool]:
-    system = contract + "\n" + _continuity_text(continuity) + "\n" + _instruction(mode, target_language, ratio)
+    system = (
+        contract + "\n" + _continuity_text(continuity)
+        + (f"\n{vincoli}" if vincoli else "")
+        + "\n" + _instruction(mode, target_language, ratio, form=form, modernize=modernize)
+    )
+    # Il giudice deve sapere cosa l'utente ha chiesto di cambiare (forma, lingua moderna, rese
+    # decise): altrimenti boccia come infedeltà proprio la trasformazione richiesta.
+    contratto_giudice = "\n".join(
+        p for p in (contract, nota_per_il_giudice(form, modernize), vincoli) if p
+    )
     result = client.chat_json(
         [{"role": "system", "content": system}, {"role": "user", "content": chunk_text}],
         schema=REWRITE_SCHEMA,
@@ -194,7 +257,7 @@ def _rewrite_one(
         judge = critic_model or model
         try:
             conforms, issues = _style_conforms(
-                contract, rewritten, target_language, client, judge, source=chunk_text
+                contratto_giudice, rewritten, target_language, client, judge, source=chunk_text
             )
             if not conforms and issues:
                 fix = " Correggi questi scostamenti dallo stile: " + "; ".join(issues)
@@ -209,7 +272,8 @@ def _rewrite_one(
                 # un testo rifatto su rilievi che nessuno ha confermato.
                 if corrected:
                     improved, _ = _style_conforms(
-                        contract, corrected, target_language, client, judge, source=chunk_text
+                        contratto_giudice, corrected, target_language, client, judge,
+                        source=chunk_text,
                     )
                     if improved:
                         result, rewritten = candidate, corrected
@@ -229,6 +293,7 @@ def _rewrite_one(
     sentences = split_sentences(rewritten)
     tail = " ".join(sentences[-2:]) if sentences else rewritten[-300:]
     new_continuity = {
+        **continuity,  # il registro della lavorazione viaggia con la continuità
         "glossary": glossary,
         "summary": str(result.get("summary", continuity.get("summary", ""))).strip()[:1500],
         "tail": tail,
@@ -295,6 +360,74 @@ def _first_chapter(chunks: list[Chunk]) -> list[Chunk]:
     return out
 
 
+def _opzioni_corrispondono(run: RewriteRun, form: str, modernize: bool) -> bool:
+    """La lavorazione trovata è lo stesso lavoro? Forma e modernizzazione ne fanno parte.
+
+    Le lavorazioni nate prima di queste opzioni non le hanno registrate: erano tutte a forma
+    conservata e lingua invariata, ed è così che si leggono.
+    """
+    opzioni = ((run.continuity or {}).get("registro") or {}).get("opzioni") or {}
+    return (
+        opzioni.get("form", FORM_KEEP) == form
+        and bool(opzioni.get("modernize", False)) == bool(modernize)
+    )
+
+
+def _decisioni_precedenti(ses: Session, document_id: int, target_language: str | None) -> dict:
+    """Le rese già decise dall'utente per questo libro in questa lingua, in lavorazioni passate.
+
+    Chi ha deciso un modo di dire nell'anteprima non deve sentirselo richiedere traducendo il
+    libro intero: la decisione riguarda il documento e la lingua, non la singola lavorazione.
+    """
+    runs = ses.exec(
+        select(RewriteRun)
+        .where(RewriteRun.document_id == document_id)
+        .where(RewriteRun.mode == "translate")
+        .where(RewriteRun.target_language == target_language)
+        .order_by(RewriteRun.id.desc())
+    ).all()
+    ereditate: dict = {}
+    for vecchia in runs:
+        idiomi = (((vecchia.continuity or {}).get("registro") or {}).get("idiomi")) or {}
+        for chiave, voce in idiomi.items():
+            if chiave not in ereditate and voce.get("stato") == DECISA:
+                ereditate[chiave] = {**copy.deepcopy(voce), "brani": []}
+    return ereditate
+
+
+def _stile_dell_originale(
+    chunks: list[Chunk], contract: str, mode: str, client: Any, model: str | None
+) -> dict:
+    """Estrae lo stile del libro di partenza e ne fa il contratto della lavorazione.
+
+    Ritorna la voce del registro: con ``contratto`` se l'estrazione è riuscita, senza (e con il
+    motivo) se no — e allora si lavora col contratto ricevuto, come prima.
+    """
+    from bookwriter.style.engine import build_style_contract, extract_source_style
+
+    testi = [c.text for c in chunks if has_prose(c.text)]
+    try:
+        profilo = extract_source_style(testi, client, name="Stile dell'originale", model=model)
+    except LLMError as exc:
+        return {"origine": "estrazione non riuscita", "errore": str(exc)}
+    if not any(str(v).strip() for v in (profilo.dimensions or {}).values()):
+        return {"origine": "estrazione non riuscita", "errore": "il modello non ha descritto lo stile"}
+    verbo = "riproducilo nella lingua di arrivo" if mode == "translate" else "conservalo"
+    contratto = (
+        "Lo stile da seguire è quello dell'ORIGINALE, estratto automaticamente dal testo: "
+        f"{verbo} — voce, ritmo, registro, lunghezza delle frasi, immagini.\n"
+        + build_style_contract(profilo)
+    )
+    if contract.strip():
+        contratto += "\n" + contract.strip()
+    return {
+        "origine": "estratto dall'originale",
+        "nome": profilo.name,
+        "profilo": profilo.model_dump(),
+        "contratto": contratto,
+    }
+
+
 def rewrite_document(
     db_path: Path,
     document_id: int,
@@ -313,7 +446,48 @@ def rewrite_document(
     redo_stalled: bool = False,
     progress=None,
     should_stop=None,
+    literary: bool | None = None,
+    idioms: bool | None = None,
+    idiom_notes: bool = False,
+    decide_idiom: Callable[[dict], Any] | None = None,
+    auto_style: bool | None = None,
+    polish: bool | None = None,
+    form: str = FORM_KEEP,
+    modernize: bool = False,
 ) -> RewriteReport:
+    """Riscrive o traduce un documento brano per brano, in ordine, con ripresa deterministica.
+
+    Opzioni della traduzione letteraria (tutte registrate nella lavorazione, vedi
+    :func:`run_record`):
+
+    - ``literary`` — interruttore generale; ``None`` vuol dire «sì se si traduce». Da lui
+      dipendono i tre valori predefiniti qui sotto;
+    - ``idioms`` — pre-passaggio sui modi di dire e i riferimenti culturali (solo traducendo).
+      Le opzioni di resa si sottopongono all'utente con ``decide_idiom(voce)``, che riceve un
+      dizionario (``chiave``, ``originale``, ``contesto``, ``tipo``, ``opzioni`` con ``tipo``/
+      ``resa``/``spiegazione``, ``lingua``, ``book_pos``) e risponde con l'indice dell'opzione,
+      con un testo libero, o con ``None`` per non decidere. È chiamata dal thread di lavoro:
+      chi la passa dalla GUI deve portare la domanda nel thread dell'interfaccia e attendere.
+      Senza risposta la voce resta «non decisa» e si decide dopo con :func:`answer_idioms`;
+    - ``idiom_notes`` — fra le opzioni compare anche la nota del traduttore (di norma no);
+    - ``auto_style`` — estrae lo stile dell'originale e lo usa come contratto; ``None`` vuol
+      dire «sì se è letteraria e l'utente non ha scelto uno stile» (``style_profile_id``);
+    - ``polish`` — passata finale di un editor madrelingua, sorvegliata (±15% di lunghezza,
+      stessi paragrafi se l'impaginazione si conserva, stessi titoli e termini fissati);
+    - ``form`` — ``"keep"`` conserva i paragrafi; ``"prose_from_verse"`` volge i versi in
+      prosa: cambia numero e lunghezza dei paragrafi, non i capitoli (titoli);
+    - ``modernize`` — grammatica e sintassi di oggi, conservando la voce dell'autore.
+    """
+    if form not in FORMS:
+        raise ValueError(f"Forma sconosciuta: {form!r} (ammesse: {', '.join(FORMS)})")
+    letteraria = (mode == "translate") if literary is None else bool(literary)
+    con_idiomi = mode == "translate" and (letteraria if idioms is None else bool(idioms))
+    con_rifinitura = letteraria if polish is None else bool(polish)
+    con_stile_auto = (
+        (letteraria and style_profile_id is None) if auto_style is None else bool(auto_style)
+    )
+    fattore = espansione(mode, form, modernize)
+
     engine = make_engine(db_path)
     with Session(engine) as ses:
         chunks = list(
@@ -332,11 +506,12 @@ def rewrite_document(
             # dettagli: lo stesso libro tradotto in cinque lingue sono cinque lavori distinti.
             # Senza questi due vincoli riprenderebbero tutti lo stesso, ognuno saltando i brani
             # fatti dagli altri, e il risultato sarebbe un unico testo in cinque lingue mescolate.
+            # Per la stessa ragione ne fanno parte la forma (versi o prosa) e la modernizzazione.
             #
             # Con ``redo_stalled`` si riapre anche una lavorazione già chiusa: si sta correggendo
             # un libro consegnato, non riprendendone uno interrotto.
             stati = ("running", "done") if redo_stalled else ("running",)
-            run = ses.exec(
+            candidate = ses.exec(
                 select(RewriteRun)
                 .where(RewriteRun.document_id == document_id)
                 .where(RewriteRun.kind == "full")
@@ -345,8 +520,12 @@ def rewrite_document(
                 .where(RewriteRun.style_profile_id == style_profile_id)
                 .where(RewriteRun.status.in_(stati))
                 .order_by(RewriteRun.id.desc())
-            ).first()
+            ).all()
+            run = next((r for r in candidate if _opzioni_corrispondono(r, form, modernize)), None)
         if run is None:
+            registro_nuovo: dict = {}
+            if con_idiomi:
+                registro_nuovo["idiomi"] = _decisioni_precedenti(ses, document_id, target_language)
             run = RewriteRun(
                 document_id=document_id,
                 style_profile_id=style_profile_id,
@@ -355,13 +534,13 @@ def rewrite_document(
                 target_language=target_language,
                 ratio=ratio,
                 status="running",
-                continuity={},
+                continuity={"registro": registro_nuovo} if registro_nuovo else {},
             )
             ses.add(run)
             ses.commit()
             ses.refresh(run)
         run_id = run.id
-        continuity = dict(run.continuity or {})
+        continuity = copy.deepcopy(dict(run.continuity or {}))
         fatti = list(ses.exec(select(RewriteChunk).where(RewriteChunk.run_id == run_id)).all())
         done_ids = {rc.chunk_id for rc in fatti}
         if redo_stalled:
@@ -378,8 +557,43 @@ def rewrite_document(
                 done_ids.discard(rc.chunk_id)
             ses.commit()
 
+    # Il registro della lavorazione: cosa si è scelto e perché, da mostrare all'utente.
+    registro: dict = continuity.setdefault("registro", {})
+    registro["opzioni"] = {
+        "form": form,
+        "modernize": bool(modernize),
+        "literary": letteraria,
+        "idioms": con_idiomi,
+        "idiom_notes": bool(idiom_notes),
+        "polish": con_rifinitura,
+        "auto_style": con_stile_auto,
+    }
+    idiomi_reg: dict = registro.setdefault("idiomi", {})
+    errori_idiomi: dict = registro.setdefault("idiomi_errori", {})
+    rifiniture: dict = registro.setdefault("rifinitura", {})
+
     todo = [c for c in targets if c.id not in done_ids]
+    fermo_subito = bool(should_stop and should_stop())
+
+    # Lo stile: quello scelto dall'utente, o quello dell'originale estratto una volta sola (e
+    # conservato, così la ripresa non lo rilegge e non cambia contratto a metà libro).
+    stile = registro.get("stile") or {}
+    if not stile.get("contratto"):
+        if con_stile_auto and not fermo_subito and any(has_prose(c.text) for c in todo):
+            stile = _stile_dell_originale(chunks, contract, mode, client, model)
+        elif style_profile_id is not None:
+            stile = {"origine": "scelto dall'utente", "profilo_id": style_profile_id}
+        elif not stile:
+            stile = {"origine": "indicato nella richiesta"}
+        registro["stile"] = stile
+    contratto = stile.get("contratto") or contract
+
+    opzioni_brano: dict[str, Any] = {
+        "mode": mode, "target_language": target_language, "ratio": ratio, "model": model,
+        "critic": critic, "critic_model": critic_model, "form": form, "modernize": modernize,
+    }
     copied = stalled = unchecked = salvati = 0
+    rifiniti = rifiniture_tenute = domande = 0
     fermato = 0  # quanti passaggi non sono stati nemmeno tentati, perché ci si è fermati
     # L'avanzamento si conta sul **libro intero**, non sui brani rimasti da fare: riprendendo
     # una traduzione a metà, «0 su 72» farebbe credere che il libro sia lungo 72 e che non sia
@@ -398,30 +612,76 @@ def rewrite_document(
             # passaggio com'è, senza spendere una chiamata e senza buchi nel testo finale.
             rewritten, copied = chunk.text, copied + 1
         else:
-            try:
-                rewritten, continuity, checked = _rewrite_one(
-                    chunk.text, contract, continuity, client,
-                    mode=mode, target_language=target_language, ratio=ratio, model=model,
-                    critic=critic, critic_model=critic_model,
+            # Modi di dire e riferimenti culturali: prima si elencano, poi decide l'utente.
+            scelte: list[dict] = []
+            if con_idiomi:
+                try:
+                    voci = trova_idiomi(chunk.text, target_language, client, model,
+                                        note=idiom_notes)
+                except LLMError as exc:
+                    # Un elenco mancato non ferma la traduzione: il brano si traduce come si
+                    # sarebbe tradotto senza, e la mancanza resta scritta nel registro.
+                    voci = []
+                    errori_idiomi[str(chunk.id)] = str(exc)
+                scelte, chieste = registra_idiomi(
+                    idiomi_reg, voci, chunk_id=chunk.id, book_pos=chunk.book_pos,
+                    target_language=target_language, decide=decide_idiom,
                 )
-                unchecked += 0 if checked else 1
-            except LLMDegenerate:
-                # Il modello si è bloccato a ripetere. Prima di rinunciare si riprova dividendo
-                # il brano: il blocco nasce quasi sempre dalla sua struttura, e le due metà
-                # separate di solito passano. Solo se fallisce anche così si conserva
-                # l'originale — che nel libro tradotto resta un pezzo nella lingua di partenza,
-                # ed è il difetto che questo tentativo serve a evitare.
-                ripreso = _riprova_dividendo(
-                    chunk.text, contract, continuity, client,
-                    mode=mode, target_language=target_language, ratio=ratio, model=model,
-                    critic=critic, critic_model=critic_model,
-                )
-                if ripreso is None:
-                    rewritten, stalled = chunk.text, stalled + 1
-                else:
-                    rewritten, continuity, checked = ripreso
-                    unchecked += 0 if checked else 1
-                    salvati += 1
+                domande += chieste
+            vincoli = testo_delle_scelte(scelte)
+
+            # Unità che stanno nel limite di una risposta, anche se l'uscita è più lunga.
+            unita = unita_di_lavoro(chunk.text, fattore=fattore, form=form)
+            pezzi: list[str] = []
+            bloccate = recuperate = 0
+            tutto_controllato = True
+            esiti: list[str] = []
+            for testo_unita in unita:
+                try:
+                    reso, continuity, checked = _rewrite_one(
+                        testo_unita, contratto, continuity, client, vincoli=vincoli, **opzioni_brano
+                    )
+                except LLMDegenerate:
+                    # Il modello si è bloccato a ripetere. Prima di rinunciare si riprova
+                    # dividendo il brano: il blocco nasce quasi sempre dalla sua struttura, e le
+                    # due metà separate di solito passano. Solo se fallisce anche così si
+                    # conserva l'originale — che nel libro tradotto resta un pezzo nella lingua
+                    # di partenza, ed è il difetto che questo tentativo serve a evitare.
+                    ripreso = _riprova_dividendo(
+                        testo_unita, contratto, continuity, client, vincoli=vincoli,
+                        **opzioni_brano,
+                    )
+                    if ripreso is None:
+                        pezzi.append(testo_unita)
+                        bloccate += 1
+                        continue
+                    reso, continuity, checked = ripreso
+                    recuperate += 1
+                tutto_controllato = tutto_controllato and checked
+                if con_rifinitura and reso.strip():
+                    fissati = [*(continuity.get("glossary") or {}).values(),
+                               *(s["resa"] for s in scelte)]
+                    reso, esito = rifinisci(
+                        reso, originale=testo_unita,
+                        target_language=target_language if mode == "translate" else None,
+                        vincolati=fissati, client=client, model=model,
+                        conserva_paragrafi=form == FORM_KEEP,
+                    )
+                    esiti.append(esito)
+                pezzi.append(reso)
+            if bloccate == len(unita):
+                rewritten = chunk.text
+            else:
+                rewritten = "\n\n".join(p for p in pezzi if p.strip())
+            stalled += 1 if bloccate else 0
+            salvati += 1 if recuperate else 0
+            if bloccate < len(unita):
+                unchecked += 0 if tutto_controllato else 1
+            if esiti:
+                rifiniture[str(chunk.id)] = esiti
+                rifiniti += 1 if any(e == "applicata" for e in esiti) else 0
+                rifiniture_tenute += 1 if any(not e.startswith("applicata") for e in esiti) else 0
+        continuity["registro"] = registro
         with Session(engine) as ses:
             ses.add(
                 RewriteChunk(
@@ -433,7 +693,7 @@ def rewrite_document(
                 )
             )
             db_run = ses.get(RewriteRun, run_id)
-            db_run.continuity = continuity
+            db_run.continuity = copy.deepcopy(continuity)
             ses.add(db_run)
             ses.commit()
         if progress:
@@ -441,9 +701,13 @@ def rewrite_document(
 
     processed = len(done_ids) + len(todo) - fermato
     status = "done" if (kind == "full" and processed >= len(targets)) else "running"
+    continuity["registro"] = registro
     with Session(engine) as ses:
         db_run = ses.get(RewriteRun, run_id)
         db_run.status = status
+        # Il registro si salva anche se non si è lavorato nessun brano: le opzioni e lo stile
+        # scelti valgono per la ripresa.
+        db_run.continuity = copy.deepcopy(continuity)
         ses.add(db_run)
         ses.commit()
     if progress:
@@ -452,7 +716,80 @@ def rewrite_document(
         run_id=run_id, processed=processed, total=len(targets), status=status,
         copied=copied, stalled=stalled, unchecked=unchecked, salvaged=salvati,
         stopped=bool(fermato),
+        polished=rifiniti, polish_kept=rifiniture_tenute, idioms_asked=domande,
+        idioms_pending=sum(1 for v in idiomi_reg.values() if v.get("stato") != DECISA),
+        style_source=str(stile.get("origine") or "") if (con_stile_auto or letteraria) else "",
+        form=form, modernized=bool(modernize),
     )
+
+
+def run_record(db_path: Path, run_id: int) -> dict:
+    """Il registro di una lavorazione, da mostrare all'utente.
+
+    Contiene: ``opzioni`` (forma, modernizzazione, passaggi attivi), ``stile`` (``origine``:
+    «estratto dall'originale» / «scelto dall'utente» / «indicato nella richiesta» / «estrazione
+    non riuscita»; con il ``profilo`` e il ``contratto`` usati quando è estratto), ``idiomi``
+    (per chiave: originale, contesto, opzioni, ``stato`` «decisa»/«non decisa», ``resa``
+    scelta, ``brani`` in cui compare), ``idiomi_errori`` e ``rifinitura`` (per brano, l'esito
+    di ogni passata: «applicata», «scartata: …», «non riuscita: …»).
+    """
+    with Session(make_engine(db_path)) as ses:
+        run = ses.get(RewriteRun, run_id)
+        if run is None:
+            return {}
+        return copy.deepcopy(((run.continuity or {}).get("registro")) or {})
+
+
+def idiom_decisions(db_path: Path, run_id: int, *, pending_only: bool = False) -> list[dict]:
+    """I modi di dire e riferimenti culturali della lavorazione, decisi e no, in ordine di libro."""
+    voci = run_record(db_path, run_id).get("idiomi") or {}
+    fuori = [{"chiave": k, **v} for k, v in voci.items()]
+    if pending_only:
+        fuori = [v for v in fuori if v.get("stato") != DECISA]
+    return sorted(fuori, key=lambda v: min(v.get("brani") or [0]))
+
+
+def answer_idioms(db_path: Path, run_id: int, answers: dict[str, Any]) -> int:
+    """Registra le decisioni date dopo (``chiave → indice d'opzione o testo``).
+
+    I brani già tradotti in cui compare una voce appena decisa — o decisa diversamente — si
+    tolgono dal fatto e la lavorazione torna «in corso»: riprendendola, solo quei brani si
+    ritraducono, con la resa scelta. Ritorna quanti brani sono stati riaperti.
+    """
+    engine = make_engine(db_path)
+    with Session(engine) as ses:
+        run = ses.get(RewriteRun, run_id)
+        if run is None:
+            raise ValueError(f"Lavorazione {run_id} inesistente.")
+        continuity = copy.deepcopy(dict(run.continuity or {}))
+        registro = continuity.setdefault("registro", {})
+        voci = registro.setdefault("idiomi", {})
+        da_riaprire: set[int] = set()
+        for chiave, risposta in answers.items():
+            voce = voci.get(chiave)
+            if voce is None:
+                continue
+            scelta = interpreta_scelta(voce, risposta)
+            if scelta is None:
+                continue
+            cambiata = voce.get("stato") != DECISA or voce.get("resa") != scelta["resa"]
+            voce.update(scelta, stato=DECISA, chiesta=True)
+            if cambiata:
+                da_riaprire.update(voce.get("brani") or [])
+        righe = ses.exec(
+            select(RewriteChunk).where(RewriteChunk.run_id == run_id)
+        ).all() if da_riaprire else []
+        riaperti = 0
+        for rc in righe:
+            if rc.chunk_id in da_riaprire:
+                ses.delete(rc)
+                riaperti += 1
+        run.continuity = continuity
+        if riaperti:
+            run.status = "running"
+        ses.add(run)
+        ses.commit()
+    return riaperti
 
 
 def assemble_markdown(db_path: Path, run_id: int) -> str:
@@ -523,6 +860,55 @@ def _align(segmenti: list[int], paragrafi: list[str]) -> tuple[dict[int, list[st
     return fuori, True
 
 
+def _allinea_per_sezioni(
+    segmenti: list[int], titoli: set[int], paragrafi: list[str]
+) -> tuple[dict[int, list[str]], bool]:
+    """Allineamento per capitoli (titoli), non per paragrafi: è quello della prosa dai versi.
+
+    Volgendo i versi in prosa i paragrafi cambiano di numero e di lunghezza per scelta, e
+    ricucirli uno a uno sui versi sarebbe un non senso. Quel che non cambia sono i capitoli —
+    canti, sezioni — cioè i titoli. Si accoppiano allora i titoli coi titoli, e dentro ogni
+    sezione la prosa va nei segmenti di testo di quella sezione: un capoverso per segmento, i
+    segmenti in avanzo spariscono, i capoversi in avanzo si accodano all'ultimo. Se i titoli non
+    tornano, si ricade sull'allineamento semplice e il blocco si dichiara ricucito.
+    """
+    import re
+
+    def e_titolo(p: str) -> bool:
+        return bool(re.match(r"^\s{0,3}#{1,6}\s", p))
+
+    seg_titoli = [i for i in segmenti if i in titoli]
+    par_titoli = [p for p in paragrafi if e_titolo(p)]
+    if len(seg_titoli) != len(par_titoli):
+        return _align(segmenti, paragrafi)
+    sezioni_seg: list[tuple[int | None, list[int]]] = [(None, [])]
+    for i in segmenti:
+        if i in titoli:
+            sezioni_seg.append((i, []))
+        else:
+            sezioni_seg[-1][1].append(i)
+    sezioni_par: list[tuple[str | None, list[str]]] = [(None, [])]
+    for p in paragrafi:
+        if e_titolo(p):
+            sezioni_par.append((p, []))
+        else:
+            sezioni_par[-1][1].append(p)
+    fuori: dict[int, list[str]] = {}
+    storto = False
+    for (titolo_seg, testi_seg), (titolo_par, testi_par) in zip(sezioni_seg, sezioni_par):
+        if titolo_seg is not None and titolo_par is not None:
+            fuori[titolo_seg] = [titolo_par]
+        if testi_seg and testi_par:
+            fuori.update(_align(testi_seg, testi_par)[0])
+        elif testi_par or testi_seg:
+            # Prosa senza versi a cui appoggiarsi, o versi rimasti senza prosa: la struttura del
+            # blocco non torna, meglio l'allineamento semplice che perdere del testo.
+            storto = True
+    if storto:
+        return _align(segmenti, paragrafi)
+    return fuori, False
+
+
 def assemble_layout(db_path: Path, run_id: int) -> LayoutAssembly | None:
     """Rimette il testo elaborato dentro l'impaginazione del documento di partenza.
 
@@ -550,6 +936,11 @@ def assemble_layout(db_path: Path, run_id: int) -> LayoutAssembly | None:
             ses.exec(select(RewriteChunk).where(RewriteChunk.run_id == run_id).order_by(RewriteChunk.book_pos))
         )
         originali = {c.id: c for c in ses.exec(select(Chunk).where(Chunk.document_id == run.document_id)).all()}
+        opzioni = ((run.continuity or {}).get("registro") or {}).get("opzioni") or {}
+    prosa = opzioni.get("form", FORM_KEEP) == FORM_PROSE_FROM_VERSE
+    from bookwriter.layout.model import HEADING
+
+    titoli = {i for i, s in enumerate(layout.segments) if s.kind == HEADING}
 
     # Per ogni segmento i pezzi ricevuti, con l'indicazione se aprono un capoverso nuovo: quelli
     # che arrivano da blocchi diversi sono la stessa frase spezzata dal chunker e vanno ricuciti;
@@ -563,7 +954,11 @@ def assemble_layout(db_path: Path, run_id: int) -> LayoutAssembly | None:
             continue
         segmenti = layout.segments_in_span(chunk.span_start, chunk.span_end)
         toccati.update(segmenti)
-        assegnati, storto = _align(segmenti, _split_paragraphs(rc.text, len(segmenti)))
+        if prosa:
+            paragrafi = [p.strip() for p in rc.text.split("\n\n") if p.strip()]
+            assegnati, storto = _allinea_per_sezioni(segmenti, titoli, paragrafi)
+        else:
+            assegnati, storto = _align(segmenti, _split_paragraphs(rc.text, len(segmenti)))
         disallineati += 1 if storto else 0
         for idx, testi in assegnati.items():
             pezzi[idx].extend((testo, n > 0) for n, testo in enumerate(testi))

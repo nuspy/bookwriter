@@ -51,12 +51,20 @@ def persist_outline(
     groups: list[tuple[str, list[Node]]],
     *,
     render_mode: str = "verbatim",
+    style_profile_id: int | None = None,
 ) -> OrganizeReport:
-    """Crea un Outline con i capitoli indicati. ``groups`` = lista di ``(titolo, nodi ordinati)``."""
+    """Crea un Outline con i capitoli indicati. ``groups`` = lista di ``(titolo, nodi ordinati)``.
+
+    ``style_profile_id`` ricorda con quale stile sono stati scritti titoli e motivazioni: la
+    stesura può riproporlo come scelta iniziale.
+    """
     groups = [(t, ns) for t, ns in groups if ns]
     engine = make_engine(db_path)
     with Session(engine) as ses:
-        outline = Outline(name=name, ordering=ordering, render_mode=render_mode, status="draft")
+        outline = Outline(
+            name=name, ordering=ordering, render_mode=render_mode, status="draft",
+            style_profile_id=style_profile_id,
+        )
         ses.add(outline)
         ses.commit()
         ses.refresh(outline)
@@ -73,3 +81,23 @@ def persist_outline(
             ses.commit()
             n_items += len(nodes)
     return OrganizeReport(outline_id=outline_id, chapters=len(groups), items=n_items)
+
+
+def style_contract_for(db_path: Path, style_id: int | str | None) -> str:
+    """Il contratto di stile di un profilo del progetto, o ``""`` se non c'è o non si legge.
+
+    È lo stesso testo che la stesura usa come istruzione di sistema: riordinare e scrivere con
+    lo stesso contratto tiene titoli, transizioni e prosa nello stesso registro.
+    """
+    if style_id in (None, ""):
+        return ""
+    from bookwriter.db.project_schema import get_style_row
+    from bookwriter.style import StyleProfile, build_style_contract
+
+    row = get_style_row(db_path, style_id)
+    if not row:
+        return ""
+    try:
+        return build_style_contract(StyleProfile.model_validate(row["data"]))
+    except Exception:  # noqa: BLE001 - un profilo illeggibile non deve fermare il riordino
+        return ""

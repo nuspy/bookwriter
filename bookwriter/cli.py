@@ -1646,10 +1646,25 @@ def forge_write(
         False, "--redo-short",
         help="Rifà i capitoli sotto il 60% del loro budget di parole: quelli di prima si mettono "
              "da parte in chapters/.superati/, non si cancellano."),
+    chapter: int = typer.Option(None, "--chapter", help="Con --trial: il capitolo da riscrivere."),
+    trial: bool = typer.Option(
+        False, "--trial",
+        help="Riscrive il capitolo --chapter in prova, in output/prove/: il capitolo in chapters/ "
+             "non si tocca."),
+    waive: str = typer.Option(
+        "", "--waive", help="Deroga motivata ai difetti bloccanti del piano (resta registrata). "
+                            "Senza, un piano con blocker non si scrive."),
+    replan: bool = typer.Option(False, "--replan",
+                                help="Butta il piano del capitolo e lo rifà prima di scrivere."),
 ) -> None:
     """Scrive i capitoli. Ognuno finisce su disco appena è pronto, prima del successivo."""
     forge = _forge()
     contratto = _forge_style(forge, style)
+    if trial or chapter is not None:
+        if not (trial and chapter):
+            err.print("[red]Errore:[/red] --chapter e --trial vanno insieme: una prova di un "
+                      "capitolo. I capitoli veri si scrivono senza.")
+            raise typer.Exit(code=2)
 
     def racconta(n) -> None:
         if isinstance(n, tuple) and n and n[0] == "section":
@@ -1657,7 +1672,34 @@ def forge_write(
         else:
             console.print(f"  {n}")
 
+    def bloccato(risultato) -> bool:
+        if risultato is None or not getattr(risultato, "blocked", None):
+            return False
+        console.print(f"[red]Fermato:[/red] il piano del capitolo {risultato.number} ha difetti "
+                      "bloccanti:", markup=True)
+        for d in risultato.blocked:
+            console.print(f"  - {d}", markup=False)
+        console.print("Ripianifica con --replan, o procedi con --waive \"motivo\".")
+        return True
+
     try:
+        if replan:
+            from bookwriter.forge import writing as fw
+
+            prossimo = fw.next_chapter(forge.project, forge.state)
+            numero = chapter or (int(prossimo.get("number") or 0) if prossimo else 0)
+            if numero:
+                forge.replan_chapter(numero, trial=trial)
+        if trial:
+            risultato = forge.write_trial(chapter, style_contract=contratto, note=racconta,
+                                          waiver=waive)
+            if bloccato(risultato):
+                raise typer.Exit(code=3)
+            if risultato.stopped:
+                console.print("Fermato: le scene scritte restano nel lavoro, si riprende da lì.")
+            else:
+                console.print(f"[green]✓[/green] prova: {risultato.line()} → {risultato.path}")
+            return
         if redo_short:
             corti = forge.short_chapters()
             if not corti:
@@ -1672,8 +1714,12 @@ def forge_write(
         elif all_chapters:
             report = forge.write_all(style_contract=contratto, note=racconta)
             console.print(report.summary())
+            if report.blocked:
+                raise typer.Exit(code=3)
         else:
-            risultato = forge.write_next(style_contract=contratto, note=racconta)
+            risultato = forge.write_next(style_contract=contratto, note=racconta, waiver=waive)
+            if bloccato(risultato):
+                raise typer.Exit(code=3)
             if risultato is None:
                 console.print("Tutti i capitoli previsti sono già su disco.")
             else:
@@ -1681,6 +1727,134 @@ def forge_write(
     except (LLMError, ValueError) as exc:
         err.print(f"[red]Errore:[/red] {exc}")
         raise typer.Exit(code=1)
+
+
+@forge_app.command("revise")
+def forge_revise(
+    chapter: int = typer.Option(..., "--chapter", help="Il capitolo da rivedere."),
+    file: Path = typer.Option(None, "--file", help="La bozza da rivedere (una prova); senza, il "
+                                                   "capitolo in chapters/."),
+    out: Path = typer.Option(None, "--out", help="Dove scrivere il testo rivisto (senza: nel "
+                                                 "capitolo, se il verdetto lo permette)."),
+    style: str = typer.Option(None, "--style", help="Profilo di stile da applicare."),
+) -> None:
+    """Un giro di revisione: diagnosi, piano, interventi, verifica indipendente, gate, verdetto.
+    Il report va in revisioni/<run>/report.md."""
+    forge = _forge()
+    contratto = _forge_style(forge, style)
+    testo = file.read_text(encoding="utf-8") if file else None
+    try:
+        esecuzione = forge.revise_chapter(chapter, text=testo, output=out, trial=file is not None,
+                                          style_contract=contratto,
+                                          note=lambda n: console.print(f"  {n}", markup=False))
+    except (LLMError, ValueError, RuntimeError) as exc:
+        err.print(f"[red]Errore:[/red] {exc}")
+        raise typer.Exit(code=1)
+    console.print(f"Verdetto: {esecuzione.verdict} · testo: {esecuzione.output_path}", markup=False)
+
+
+@forge_app.command("surprise")
+def forge_surprise(
+    description: str = typer.Argument("", help="Cosa deve raccontare il libro, in poche frasi. "
+                                                "Vuoto: riprende la sorpresa interrotta."),
+    style: str = typer.Option(None, "--style", help="Profilo di stile da applicare."),
+) -> None:
+    """«Sorpresa»: una descrizione minima, e tutto il resto lo decide l'assistente — dal quaderno
+    al libro composto."""
+    forge = _forge()
+    contratto = _forge_style(forge, style)
+
+    def racconta(n) -> None:
+        if isinstance(n, tuple) and n and n[0] == "section":
+            console.print(f"  capitolo {n[1]}: scena {n[2]} di {n[3]}")
+        elif not isinstance(n, tuple):
+            console.print(f"  {n}", markup=False)
+
+    try:
+        console.print(forge.surprise(description, style_contract=contratto, note=racconta),
+                      markup=False)
+    except (LLMError, ValueError, RuntimeError) as exc:
+        err.print(f"[red]Errore:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
+@forge_app.command("ledger")
+def forge_ledger(
+    rebuild: bool = typer.Option(False, "--rebuild",
+                                 help="Rifà tutte le schede, anche quelle aggiornate."),
+    upto: int = typer.Option(None, "--upto", help="Solo i capitoli fino a questo numero."),
+) -> None:
+    """Il registro della continuità: ricava le schede dai capitoli scritti (story/ledger.md)."""
+    from bookwriter.forge import ledger as lg
+
+    forge = _forge()
+    try:
+        rifatti = forge.ledger_rebuild(upto=upto, only_stale=not rebuild,
+                                       progress=lambda i, n: console.print(f"  scheda {i + 1} di {n}")
+                                       if i < n else None)
+    except (LLMError, RuntimeError) as exc:
+        err.print(f"[red]Errore:[/red] {exc}")
+        raise typer.Exit(code=1)
+    registro = lg.load(forge.project)
+    for n in sorted(registro.chapters):
+        v = registro.chapters[n]
+        stato = f"errore: {v.error}" if v.error else (v.end_state.place or "?")
+        console.print(f"  {n}. {v.title} — fine: {stato}", markup=False)
+    console.print(f"[green]✓[/green] {len(rifatti)} schede ricavate → "
+                  f"{lg.ledger_path(forge.project).with_suffix('.md')}")
+
+
+@forge_app.command("claims")
+def forge_claims(
+    rebuild: bool = typer.Option(False, "--rebuild", help="Rifà l'archivio anche se è aggiornato."),
+) -> None:
+    """L'archivio delle affermazioni della ricerca: uniche, con fonti verificate e indipendenti."""
+    from collections import Counter
+
+    forge = _forge()
+    archivio = forge.claim_store(rebuild=rebuild, note=lambda m: console.print(f"  {m}"))
+    if archivio is None:
+        console.print("Nessuna ricerca da riordinare.")
+        return
+    for chiave, valore in archivio.stats.items():
+        console.print(f"  {chiave}: {valore}")
+    sostegno = Counter(c.support for c in archivio.claims)
+    console.print("  sostegno: " + ", ".join(f"{k} {v}" for k, v in sostegno.most_common()))
+
+
+@forge_app.command("editorial")
+def forge_editorial(
+    chapter: int = typer.Option(..., "--chapter", help="Il capitolo da misurare."),
+    trial: bool = typer.Option(False, "--trial", help="Misura la prova invece del capitolo."),
+) -> None:
+    """Le misure editoriali di un capitolo (ripetizioni, addensamenti, dialogo), senza modello."""
+    forge = _forge(with_client=False)
+    try:
+        resoconto = forge.editorial_measures(chapter, trial=trial)
+    except ValueError as exc:
+        err.print(f"[red]Errore:[/red] {exc}")
+        raise typer.Exit(code=1)
+    console.print(resoconto.metrics_before, markup=False)
+
+
+@forge_app.command("benchmark")
+def forge_benchmark(
+    chapter: int = typer.Option(..., "--chapter", help="Il capitolo da confrontare con la sua prova."),
+) -> None:
+    """Il capitolo scritto e la sua prova, misurati fianco a fianco (output/editoriale/)."""
+    forge = _forge(with_client=False)
+    try:
+        prima = forge.editorial_measures(chapter)
+        dopo = forge.editorial_measures(chapter, trial=True)
+    except ValueError as exc:
+        err.print(f"[red]Errore:[/red] {exc}")
+        raise typer.Exit(code=1)
+    path = forge.write_benchmark(chapter, prima, dopo)
+    console.print("## Capitolo scritto", markup=False)
+    console.print(prima.metrics_before, markup=False)
+    console.print("\n## Prova", markup=False)
+    console.print(dopo.metrics_before, markup=False)
+    console.print(f"[green]✓[/green] confronto → {path}")
 
 
 @forge_app.command("matter")

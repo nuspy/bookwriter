@@ -115,3 +115,58 @@ def test_html_does_not_let_the_text_become_markup(tmp_path: Path) -> None:
     """Un libro può contenere < e >: devono restare testo, non diventare tag."""
     html = preview.to_html("Se x < y allora <b>attenzione</b> a <script>.")
     assert "&lt;script&gt;" in html and "<script>" not in html
+
+
+def _lavori(tmp_path: Path):
+    """Un progetto con il libro da zero (due capitoli e uno a metà) e una prova da non mostrare."""
+    import json
+    from types import SimpleNamespace
+
+    from bookwriter.forge.project import BookProject, ForgeState
+
+    ppaths = SimpleNamespace(root=tmp_path, book=tmp_path / "book", db=tmp_path / "p.db")
+    progetto = BookProject(ppaths.book)
+    progetto.chapters_dir.mkdir(parents=True)
+    (progetto.chapters_dir / "01_la-partenza.md").write_text("# La partenza\n\nPrimo.",
+                                                             encoding="utf-8")
+    (progetto.chapters_dir / "02_il-viaggio.md").write_text("# Il viaggio\n\nSecondo.",
+                                                            encoding="utf-8")
+    stato = ForgeState()
+    stato.notebook["title"] = "Il filo rosso"
+    stato.outline = [{"number": n, "title": t} for n, t in
+                     ((1, "La partenza"), (2, "Il viaggio"), (3, "Lo scavo"), (4, "La corte"))]
+    progetto.save_state(stato)
+    parziali = ppaths.book / ".forge" / "partial"
+    parziali.mkdir(parents=True)
+    (parziali / "03_lo-scavo.json").write_text(json.dumps(
+        {"kind": "scenes", "budget": 3000, "texts": {"1": "Scena uno scritta.",
+                                                     "2": "Scena due scritta."}}),
+        encoding="utf-8")
+    (parziali / "prova_04_la-corte.json").write_text(json.dumps(
+        {"kind": "scenes", "budget": 3000, "texts": {"1": "Una prova."}}), encoding="utf-8")
+    return ppaths
+
+
+def test_the_book_written_by_the_assistant_can_be_read_while_it_grows(tmp_path: Path) -> None:
+    """I capitoli dei lavori dell'assistente stanno in cartelle, non nel database: l'anteprima
+    li legge lo stesso, col capitolo a metà, senza le prove."""
+    ppaths = _lavori(tmp_path)
+    sorgenti = preview.sources(ppaths.db, preview.forge_roots(ppaths))
+
+    assert len(sorgenti) == 1
+    s = sorgenti[0]
+    assert s.kind == "forge" and s.done == 2 and s.total == 4 and s.running
+    assert "libro da zero" in s.label and "Il filo rosso" in s.label
+
+    testo = preview.text_of(ppaths.db, s)
+    assert testo.index("Primo.") < testo.index("Secondo.") < testo.index("Scena uno scritta.")
+    assert "# Lo scavo" in testo and "Scena due scritta." in testo
+    assert "Una prova." not in testo, "una prova non è il libro"
+
+
+def test_an_empty_work_folder_is_not_offered(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    ppaths = SimpleNamespace(root=tmp_path, book=tmp_path / "book", db=tmp_path / "p.db")
+    (tmp_path / "completa" / "chapters").mkdir(parents=True)
+    assert preview.sources(ppaths.db, preview.forge_roots(ppaths)) == []

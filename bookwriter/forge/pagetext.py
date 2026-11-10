@@ -74,6 +74,9 @@ class Cleaned:
     #: ``False`` = non leggibile: ``reason`` dice perché e il testo non va al modello
     readable: bool = True
     reason: str = ""
+    #: chi l'ha scritta e quando, dai metadati della pagina (vuoti se la pagina non lo dice)
+    author: str = ""
+    published: str = ""
 
     def summary(self) -> str:
         """Il conteggio di ciò che è stato tolto, in una riga (va accanto alla pagina)."""
@@ -141,6 +144,102 @@ def youtube_description(html: str) -> tuple[str, str]:
     return titolo.strip(), desc.strip()
 
 
+# ---- chi ha scritto la pagina e quando --------------------------------------------------------------
+#: i meta tag con l'autore, nell'ordine in cui ci si fida (citazioni accademiche prima)
+_AUTHOR_META = ("citation_author", "dc.creator", "dcterms.creator", "author", "article:author",
+                "parsely-author", "sailthru.author", "byl")
+#: i meta tag con la data di pubblicazione
+_DATE_META = ("citation_publication_date", "citation_date", "dc.date", "dcterms.date",
+              "dcterms.issued", "article:published_time", "og:published_time", "datepublished",
+              "pubdate", "publish-date", "date", "sailthru.date", "parsely-pub-date")
+_ISO_DATE = re.compile(r"\b(\d{4})(?:[-/.](\d{1,2})(?:[-/.](\d{1,2}))?)?")
+
+
+def _date(valore: str) -> str:
+    """Una data leggibile da quello che scrivono le pagine: ``2019-03-07``, ``2019-03``, ``2019``."""
+    m = _ISO_DATE.search(valore or "")
+    if not m or not 1000 <= int(m.group(1)) <= 2100:
+        return ""
+    anno, mese, giorno = m.group(1), m.group(2), m.group(3)
+    if mese and 1 <= int(mese) <= 12:
+        if giorno and 1 <= int(giorno) <= 31:
+            return f"{anno}-{int(mese):02d}-{int(giorno):02d}"
+        return f"{anno}-{int(mese):02d}"
+    return anno
+
+
+def _author(valore: str) -> str:
+    """Un nome d'autore pulito: niente «By», niente indirizzi web, niente liste interminabili."""
+    testo = re.sub(r"\s+", " ", valore or "").strip()
+    testo = re.sub(r"^(by|di|von|par|por)\s+", "", testo, flags=re.IGNORECASE)
+    if not testo or testo.startswith(("http://", "https://", "@")) or len(testo) > 120:
+        return ""
+    return testo
+
+
+def _ld_items(soup) -> list[dict]:
+    """Gli oggetti JSON-LD della pagina (anche dentro ``@graph`` o in una lista)."""
+    oggetti: list[dict] = []
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            dati = json.loads(tag.string or tag.get_text() or "")
+        except ValueError:
+            continue
+        coda = dati if isinstance(dati, list) else [dati]
+        while coda:
+            voce = coda.pop(0)
+            if isinstance(voce, dict):
+                oggetti.append(voce)
+                if isinstance(voce.get("@graph"), list):
+                    coda.extend(voce["@graph"])
+            elif isinstance(voce, list):
+                coda.extend(voce)
+    return oggetti
+
+
+def _ld_author(valore) -> str:
+    if isinstance(valore, list):
+        nomi = [n for n in (_ld_author(v) for v in valore[:3]) if n]
+        return ", ".join(nomi)
+    if isinstance(valore, dict):
+        return _author(str(valore.get("name") or ""))
+    return _author(str(valore or ""))
+
+
+def page_meta(soup) -> tuple[str, str]:
+    """Autore e data di pubblicazione di una pagina, da quello che la pagina dichiara.
+
+    Si legge solo ciò che la pagina dice di sé (meta tag, JSON-LD, ``<time>``): niente si deduce
+    dal testo, perché una bibliografia con una data inventata è peggio di una senza data.
+    """
+    meta: dict[str, list[str]] = {}
+    for tag in soup.find_all("meta"):
+        nome = str(tag.get("name") or tag.get("property") or tag.get("itemprop") or "").lower()
+        contenuto = str(tag.get("content") or "").strip()
+        if nome and contenuto:
+            meta.setdefault(nome, []).append(contenuto)
+    autore = ""
+    for chiave in _AUTHOR_META:
+        valori = [a for a in (_author(v) for v in meta.get(chiave, [])) if a]
+        if valori:
+            autore = ", ".join(dict.fromkeys(valori[:3]))
+            break
+    data = next((d for chiave in _DATE_META for d in map(_date, meta.get(chiave, [])) if d), "")
+    if not (autore and data):
+        for voce in _ld_items(soup):
+            if not autore and voce.get("author"):
+                autore = _ld_author(voce["author"])
+            if not data:
+                data = _date(str(voce.get("datePublished") or voce.get("dateCreated") or ""))
+            if autore and data:
+                break
+    if not data:
+        tempo = soup.find("time", attrs={"datetime": True})
+        if tempo is not None:
+            data = _date(str(tempo.get("datetime")))
+    return autore, data
+
+
 def is_youtube(url: str) -> bool:
     host = urlparse(url or "").netloc.lower()
     return host.endswith("youtube.com") or host == "youtu.be" or host.endswith("youtube-nocookie.com")
@@ -156,6 +255,7 @@ def clean_html(html: str, url: str = "", *, min_chars: int = 400) -> Cleaned:
     soup = BeautifulSoup(html or "", "html.parser")
     prima = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
     out = Cleaned(chars_before=len(prima))
+    out.author, out.published = page_meta(soup)  # prima della pulizia: i metadati sono negli script
     rimossi = {"elementi di pagina": 0, "banner cookie e consenso": 0, "menu e liste di link": 0,
                "righe di promozione": 0, "righe legali e di piè di pagina": 0}
 

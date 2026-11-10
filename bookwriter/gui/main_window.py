@@ -2,24 +2,28 @@
 
 from __future__ import annotations
 
+import html
 import os
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 
 from llmswitch import Registry
-from PySide6.QtCore import Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QScrollArea,
     QFrame,
     QGridLayout,
     QFormLayout,
@@ -33,6 +37,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QDoubleSpinBox,
     QSpinBox,
@@ -67,6 +72,8 @@ from bookwriter.compose import compose_outline, compose_to_markdown
 from bookwriter.compose.narrative import FIDELITY_FAITHFUL, FIDELITY_FREE
 from bookwriter.config import (
     DEFAULT_BASE_URL,
+    JEV_DEFAULT_MODEL,
+    JEV_DEFAULT_URL,
     PROVIDERS,
     SEARCH_ENGINES,
     SUPPORTED_LANGUAGES,
@@ -95,10 +102,12 @@ from bookwriter.forge import notebook as nb
 from bookwriter.forge import questions as fg_questions
 from bookwriter.forge import research_store as rstore
 from bookwriter.forge import saves as fg_saves
+from bookwriter.forge import quality as ql
 from bookwriter.forge.production import trim_of
 from bookwriter.forge.writing import MATTER
 from bookwriter.gui.chat import ChatPanel, muted_color
 from bookwriter.gui import phase_guide as pg
+from bookwriter.gui import theme
 from bookwriter.gui.i18n import UI_LANGUAGES, current_language, set_language, t
 from bookwriter.gui.research_view import ResearchExplorer
 from bookwriter.gui.review_view import ReviewPage
@@ -112,7 +121,7 @@ from bookwriter.gui.servers_dialog import (
 from bookwriter.llm import servers as llm_servers
 from bookwriter.gui.worker import INTERROTTO, Worker
 from bookwriter.ingest import pipeline
-from bookwriter.ingest.loaders import load_document
+from bookwriter.ingest.loaders import FORMAT_GROUPS, SUPPORTED_EXTENSIONS, load_document
 from bookwriter.interact import (
     build_brief,
     format_brief,
@@ -125,6 +134,11 @@ from bookwriter.llm import LMStudioClient, ModelInfo
 from bookwriter.memory import (
     LanceStore,
     build_graph,
+    build_typed_links,
+    contradictions,
+    deduplicate_nodes,
+    list_merges,
+    restore_merge,
     embed_chunks,
     embed_nodes,
     graph_stats,
@@ -133,6 +147,8 @@ from bookwriter.memory import (
 )
 from bookwriter.organize import (
     list_outlines,
+    organize_purpose,
+    style_contract_for,
     organize_chronological,
     organize_custom,
     organize_narrative,
@@ -144,7 +160,15 @@ from bookwriter.organize import (
     subdivide_sections,
 )
 from bookwriter.projects import ProjectManager
-from bookwriter.rewrite import preview_pairs, rewrite_document, write_result
+from bookwriter.rewrite import (
+    FORM_KEEP,
+    FORM_PROSE_FROM_VERSE,
+    answer_idioms,
+    idiom_decisions,
+    preview_pairs,
+    rewrite_document,
+    write_result,
+)
 from bookwriter.style import (
     StyleProfile,
     abstract_style,
@@ -153,8 +177,18 @@ from bookwriter.style import (
     build_style_contract,
     extract_style,
 )
+from bookwriter.style.engine import campione_rappresentativo
 from bookwriter.style.library import get_global_style, list_global_styles
-from bookwriter.style.models import AuthorWeight
+from bookwriter.style.models import STYLE_DIMENSIONS, AuthorWeight
+
+#: I nomi inglesi delle dimensioni di stile, per chi combina gli autori con l'interfaccia in
+#: inglese (il manuale le chiama così).
+_STYLE_DIM_ALIASES: dict[str, str] = {
+    "syntax": "sintassi", "punctuation": "punteggiatura", "vocabulary": "lessico",
+    "lexicon": "lessico", "figures": "figure", "figures of speech": "figure", "rhythm": "ritmo",
+    "voice": "voce", "tone": "tono", "register": "tono", "cohesion": "coesione",
+    "paragraph": "paragrafo", "paragraphs": "paragrafo",
+}
 from bookwriter.update import revise_draft, write_revision, write_revision_html
 from bookwriter.update.revise import split_draft
 
@@ -224,10 +258,24 @@ class _BottomRow(QWidget):
         self._place(bisogno > self.width())
 
 
+class _Domande(QObject):
+    """Il ponte con cui un lavoro in corso fa una domanda all'autore e aspetta la risposta.
+
+    Il lavoro gira in un altro thread e non può aprire finestre: emette ``chiedi`` con la
+    funzione che costruisce la domanda, la finestra la esegue nel suo thread e sveglia il lavoro.
+    """
+
+    chiedi = Signal(object)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("bookwriter")
+        self._domande = _Domande()
+        self._domande.chiedi.connect(self._answer_in_gui)
+        self._idioms_silenced = False
+        self._last_translation: tuple[Path, int] | None = None
         self.resize(1000, 700)
         self.pm = ProjectManager()
         self.pm.ensure()
@@ -238,6 +286,7 @@ class MainWindow(QMainWindow):
         self._queue: list[QueuedBook] = []
         self._queue_stop = False
         self._stop_requested = False
+        self._forge_mode = "nuovo"  # il lavoro del pannello a fasi: nuovo, completa, aggiorna
         # Chi ascolta l'avanzamento del lavoro in corso (la scheda «Scrivi da zero» lo mostra
         # nel riquadro di stato). Si imposta e si toglie con il lavoro, vedi ``_forge_job``.
         self._bg_hook: Callable[[int, int], None] | None = None
@@ -279,6 +328,11 @@ class MainWindow(QMainWindow):
         self._usage_timer.timeout.connect(self._tick_usage)
 
         set_language(load_global_config().ui.language)
+        from bookwriter.gui import theme as _theme
+
+        _theme.apply(load_global_config().ui.theme)
+        _theme.follow_system()
+        _theme.on_change(self._repaint_themed)
         self._build_central()
 
         self.progress_bar = QProgressBar()
@@ -292,6 +346,8 @@ class MainWindow(QMainWindow):
         self.stop_button.setVisible(False)
         self.stop_button.clicked.connect(self._request_stop)
         self.statusBar().addPermanentWidget(self.stop_button)
+        self._trawl_label = QLabel("")
+        self.statusBar().addPermanentWidget(self._trawl_label)
         self.statusBar().showMessage(t("Pronto"))
         self._reload_projects()
         self._auto_start_browser_if_enabled()
@@ -305,9 +361,29 @@ class MainWindow(QMainWindow):
             if cfg.research.auto_start_browser and "127.0.0.1" in target_url:
                 import threading
                 from bookwriter.forge import browser_service
-                threading.Thread(target=browser_service.start_trawl, kwargs={"wait_ready": False}, daemon=True).start()
+
+                def avvia() -> None:
+                    ok = browser_service.start_trawl(wait_ready=True, timeout_s=45.0)
+                    self._trawl_state = (ok, browser_service.last_error)
+
+                self._trawl_state = None
+                threading.Thread(target=avvia, daemon=True).start()
+                QTimer.singleShot(1000, self._report_trawl)
         except Exception:
             pass
+
+    def _report_trawl(self, tentativi: int = 0) -> None:
+        """Dice nella barra di stato se il navigatore per le pagine bloccate (TRAWL) è attivo."""
+        stato = getattr(self, "_trawl_state", None)
+        if stato is None:
+            if tentativi < 60:
+                QTimer.singleShot(1000, lambda: self._report_trawl(tentativi + 1))
+            return
+        ok, errore = stato
+        self._trawl_label.setText(t("Pagine bloccate: TRAWL attivo") if ok else
+                                  t("Pagine bloccate: TRAWL spento — {0}").format(errore))
+        self._trawl_label.setToolTip(t("TRAWL legge le pagine che i siti bloccano ai programmi "
+                                       "(Cloudflare, captcha). Parte e si chiude con l'app."))
 
 
     def _build_central(self) -> None:
@@ -317,31 +393,92 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.addLayout(self._build_project_bar())
         self.tabs = QTabWidget()
-        # Ogni scheda ha un titolo funzionale, un aggiornatore dei dati e l'indicazione se
-        # serva un progetto attivo. Il dispatch è per indice, così i titoli restano liberi
-        # di cambiare senza rompere la logica.
+        self.tabs.setObjectName("mainTabs")
+        # Le schede sono raggruppate per funzione: una scheda di primo livello per ogni lavoro,
+        # con dentro le sue sotto-schede. Ogni pagina ha un titolo, un aggiornatore dei dati e
+        # l'indicazione se serva un progetto attivo; il dispatch è per indice, così i titoli
+        # restano liberi di cambiare senza rompere la logica.
         self._tab_refreshers: list[tuple[Callable[[], None] | None, bool]] = []
+        self._subtabs: dict[int, QTabWidget] = {}
+        # Il pannello a fasi è uno solo: lo ospita la scheda del lavoro che si sta guardando
+        # (scrivere da zero, completare, aggiornare), ciascuno con il suo libro.
+        self._forge_page = self._tab_authoring()
+        self._forge_hosts: dict[str, QWidget] = {}
+
+        def ospite(modo: str) -> tuple[QWidget, Callable[[], None]]:
+            w = QWidget()
+            QVBoxLayout(w).setContentsMargins(0, 0, 0, 0)
+            self._forge_hosts[modo] = w
+            return w, lambda: self._show_forge_in(modo)
+
+        nuovo, mostra_nuovo = ospite("nuovo")
+        completa, mostra_completa = ospite("completa")
+        aggiorna, mostra_aggiorna = ospite("aggiorna")
+        nuovo.layout().addWidget(self._forge_page)  # finché non si apre un altro lavoro
+        progetto_qa = (lambda: self._refresh_questions(self.pm.paths(self.pm.active_slug())))
         tab_specs = [
-            (self._tab_ingest(), t("1 · Importa testi"), None, True),
-            (self._tab_memory(), t("2 · Prepara contenuti"), self._refresh_memory_tab, True),
-            (self._tab_organize(), t("3 · Componi il libro"), self._refresh_compose_lists, True),
-            (self._tab_outline(), t("Struttura (modifica)"), self._refresh_outline_combo, True),
-            (self._tab_style(), t("Stile di scrittura"), self._refresh_styles, True),
-            (self._tab_interact(), t("Completa i contenuti"),
-             lambda: self._refresh_questions(self.pm.paths(self.pm.active_slug())), True),
-            (self._tab_brief(), t("Riepilogo progetto"), self._do_brief, True),
-            (self._tab_rewrite(), t("Riscrivi in altro stile"), self._refresh_rewrite_lists, True),
-            (self._tab_translate(), t("Traduci"), self._refresh_translate_lists, True),
-            (self._tab_queue(), t("Coda di lavorazione"), self._refresh_queue_table, True),
-            (self._tab_reading(), t("Leggi il libro"), lambda: self._refresh_reading(forza=True), True),
-            (self._tab_authoring(), t("Scrivi da zero"), self._refresh_forge, True),
-            (self._tab_update(), t("Aggiorna un libro"), None, True),
-            (self._tab_usage(), t("Consumi dei modelli"), self._refresh_usage, False),
-            (self._tab_settings(), t("Impostazioni"), self._refresh_settings, False),
+            ("notes", t("Scrivi libro da appunti"), [
+                (self._tab_ingest(), t("1 · Importa testi"), None, True),
+                (self._tab_memory(), t("2 · Prepara contenuti"), self._refresh_memory_tab, True),
+                (self._tab_outline(), t("3 · Struttura"), self._refresh_outline_combo, True),
+                (self._tab_organize(), t("4 · Componi il libro"), self._refresh_compose_lists,
+                 True),
+                (self._tab_brief(), t("Riepilogo progetto"), self._do_brief, True),
+            ]),
+            ("scratch", t("Scrivi da zero"), (nuovo, mostra_nuovo, True)),
+            ("complete", t("Completa un libro"), [
+                (completa, t("Completa (a fasi)"), mostra_completa, True),
+                (self._tab_interact(), t("Lacune negli appunti"), progetto_qa, True),
+            ]),
+            ("update", t("Aggiorna un libro"), [
+                (aggiorna, t("Aggiorna (a fasi)"), mostra_aggiorna, True),
+                (self._tab_update(), t("Integra dagli appunti"), None, True),
+            ]),
+            ("rewrite", t("Riscrivi in altro stile"),
+             (self._tab_rewrite(), self._refresh_rewrite_lists, True)),
+            ("translate", t("Traduci"), (self._tab_translate(), self._refresh_translate_lists,
+                                         True)),
+            ("style", t("Stile di scrittura"), (self._tab_style(), self._refresh_styles, True)),
+            ("read", t("Leggi anteprima in lavorazione"),
+             (self._tab_reading(), lambda: self._refresh_reading(forza=True), True)),
+            ("quality", t("Qualità"), [
+                (self._tab_quality_chapter(), t("Un capitolo"), self._refresh_quality_chapter,
+                 True),
+                (self._tab_quality_book(), t("Il libro intero"), self._refresh_quality_book,
+                 True),
+                (self._tab_structure(), t("Struttura del libro"), self._refresh_structure,
+                 True),
+            ]),
+            ("utility", t("Utilità"), [
+                (self._tab_queue(), t("Coda di lavorazione"), self._refresh_queue_table, True),
+                (self._tab_usage(), t("Consumi dei modelli"), self._refresh_usage, False),
+                (self._tab_settings(), t("Impostazioni"), self._refresh_settings, False),
+            ]),
         ]
-        for widget, title, refresher, needs_project in tab_specs:
-            self.tabs.addTab(widget, title)
-            self._tab_refreshers.append((refresher, needs_project))
+        self._tab_keys: list[str] = []
+        for chiave, title, contenuto in tab_specs:
+            self._tab_keys.append(chiave)
+            if isinstance(contenuto, list):
+                sotto = QTabWidget()
+                sotto.setObjectName("subTabs")
+                sotto.setDocumentMode(True)
+                pagine: list[tuple[Callable[[], None] | None, bool]] = []
+                for widget, sub_title, refresher, needs_project in contenuto:
+                    sotto.addTab(widget, sub_title)
+                    pagine.append((refresher, needs_project))
+                indice = self.tabs.addTab(sotto, title)
+                self._subtabs[indice] = sotto
+                sotto.currentChanged.connect(
+                    lambda i, ps=pagine: self._run_refresher(*ps[i]) if 0 <= i < len(ps) else None)
+                sotto.setProperty("pages", pagine)
+                self._tab_refreshers.append(
+                    (lambda st=sotto, ps=pagine: self._run_refresher(*ps[st.currentIndex()]),
+                     False))
+            else:
+                widget, refresher, needs_project = contenuto
+                self.tabs.addTab(widget, title)
+                self._tab_refreshers.append((refresher, needs_project))
+        self._decorate_tabs()
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs)
         self.setCentralWidget(central)  # Qt elimina il precedente, se c'era
@@ -350,14 +487,52 @@ class MainWindow(QMainWindow):
         if hasattr(self, "stop_button"):
             self._label_stop_button()
 
+    def _decorate_tabs(self) -> None:
+        """Icone e colori delle schede, uno per lavoro (vedi :mod:`bookwriter.gui.theme`)."""
+        from bookwriter.gui import theme
+
+        theme.decorate_tabs(self.tabs, self._tab_keys, self._subtabs)
+
     def _on_tab_changed(self, index: int) -> None:
         """Aggiorna il pannello selezionato con i dati correnti."""
         if not 0 <= index < len(self._tab_refreshers):
             return
-        refresher, needs_project = self._tab_refreshers[index]
+        self._run_refresher(*self._tab_refreshers[index])
+
+    def _run_refresher(self, refresher, needs_project: bool) -> None:
         if refresher is None or (needs_project and not self.pm.active_slug()):
             return
         refresher()
+
+    def _go_to_page(self, refresher) -> bool:
+        """Apre la scheda (o sotto-scheda) che ha quell'aggiornatore. Vero se l'ha trovata."""
+        for indice, (aggiorna, _) in enumerate(self._tab_refreshers):
+            if aggiorna == refresher:
+                self.tabs.setCurrentIndex(indice)
+                return True
+            sotto = self._subtabs.get(indice)
+            pagine = sotto.property("pages") if sotto is not None else None
+            for j, (agg, _np) in enumerate(pagine or []):
+                if agg == refresher:
+                    self.tabs.setCurrentIndex(indice)
+                    sotto.setCurrentIndex(j)
+                    return True
+        return False
+
+    def _show_forge_in(self, modo: str) -> None:
+        """Il pannello a fasi va nella scheda del lavoro aperto, e lavora sul suo libro."""
+        ospite = self._forge_hosts.get(modo)
+        if ospite is None:
+            return
+        if self._forge_page.parentWidget() is not ospite:
+            ospite.layout().addWidget(self._forge_page)
+        self._forge_page.show()
+        if modo != self._forge_mode:
+            self._forge_mode = modo
+            self._fg_shown_phase = ""
+            self._chat_key = None
+        if self.pm.active_slug():
+            self._refresh_forge()
 
     # ------------------------------------------------------------------ #
     #  infrastruttura
@@ -645,7 +820,40 @@ class MainWindow(QMainWindow):
         self.ui_lang_combo.setCurrentIndex(max(self.ui_lang_combo.findData(current_language()), 0))
         self.ui_lang_combo.currentIndexChanged.connect(self._on_ui_language_changed)
         bar.addWidget(self.ui_lang_combo)
+        bar.addWidget(QLabel(t("Aspetto:")))
+        self.theme_combo = QComboBox()
+        self.theme_combo.setToolTip(t("Giorno, notte, oppure come il sistema (cambia da solo "
+                                      "quando cambia il sistema)."))
+        self.theme_combo.setAccessibleName(t("Aspetto della finestra"))
+        for valore, etichetta in (("auto", t("◐ Automatico")), ("light", t("☀ Giorno")),
+                                  ("dark", t("☾ Notte"))):
+            self.theme_combo.addItem(etichetta, valore)
+        self.theme_combo.setCurrentIndex(max(self.theme_combo.findData(
+            load_global_config().ui.theme), 0))
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        bar.addWidget(self.theme_combo)
         return bar
+
+    def _on_theme_changed(self, _index: int) -> None:
+        """Giorno, notte o automatico: si applica subito e vale per tutti i progetti."""
+        from bookwriter.gui import theme
+
+        valore = self.theme_combo.currentData() or "auto"
+        theme.apply(valore)
+        cfg = load_global_config()
+        cfg.ui.theme = valore
+        self.pm.save_global_config(cfg)
+
+    def _repaint_themed(self) -> None:
+        """Ridisegna ciò che ha colori calcolati (comandi e passi delle fasi) dopo un cambio di
+        tema: la palette cambia da sola, quei colori no."""
+        if self.pm.active_slug() and hasattr(self, "fg_cmds"):
+            try:
+                forge = self._forge()
+                if forge is not None:
+                    self._forge_paint(forge)
+            except Exception:  # noqa: BLE001 - un ridisegno mancato non è un errore
+                pass
 
     def closeEvent(self, event) -> None:  # noqa: N802 — nome imposto da Qt
         """Chiudere la finestra deve fermare il lavoro, non lasciarlo correre di nascosto.
@@ -781,6 +989,11 @@ class MainWindow(QMainWindow):
         if not slug:
             self.project_info.setText(t("nessun progetto"))
             return
+        if hasattr(self, "audio_device"):
+            indice = self.audio_device.findData(self.pm.config_for(slug).chunking.audio_device)
+            self.audio_device.blockSignals(True)
+            self.audio_device.setCurrentIndex(max(indice, 0))
+            self.audio_device.blockSignals(False)
         info = self.pm.info(slug)
         db = self.pm.paths(slug).db
         nodes = graph_stats(db)["nodes"]
@@ -813,7 +1026,10 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
         lay.addWidget(self._hint(
             t("Passo 1 — Aggiungi i testi di partenza: appunti, capitoli, interi documenti. "
-            "Verranno copiati nel progetto e spezzati in blocchi. Formati: txt, md, pdf, docx, epub.")
+            "Verranno copiati nel progetto e spezzati in blocchi. Formati: testi e documenti (txt, "
+            "md, pdf, docx, epub), scansioni e foto (riconoscimento del testo), audio (trascritto), "
+            "posta (eml, msg, mbox), pagine web salvate (html, mhtml) e fogli di calcolo (csv, "
+            "xlsx, ods).")
         ))
         btns = QHBoxLayout()
         add_files = QPushButton(t("Aggiungi file…"))
@@ -825,6 +1041,16 @@ class MainWindow(QMainWindow):
         self.recursive_cb = QCheckBox(t("Includi le sottocartelle"))
         self.recursive_cb.setChecked(True)
         btns.addWidget(self.recursive_cb)
+        btns.addWidget(QLabel(t("Trascrivi l'audio su:")))
+        self.audio_device = QComboBox()
+        self.audio_device.addItem(t("processore (CPU)"), "cpu")
+        self.audio_device.addItem(t("scheda grafica (GPU)"), "cuda")
+        self.audio_device.setToolTip(t(
+            "La trascrizione dei file audio. Sulla GPU è molto più veloce, ma occupa memoria "
+            "accanto al modello caricato. Al primo uso si scarica il modello di trascrizione "
+            "(circa 480 MB)."))
+        self.audio_device.currentIndexChanged.connect(self._save_audio_device)
+        btns.addWidget(self.audio_device)
         btns.addStretch(1)
         lay.addLayout(btns)
         lay.addWidget(QLabel(t("Trascina qui file o cartelle, oppure usa i pulsanti:")))
@@ -844,8 +1070,30 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.ingest_result)
         return w
 
+    def _import_filter(self) -> str:
+        """I filtri del dialogo «Scegli file»: tutti i formati importabili, poi per gruppo."""
+        nomi = {"documenti": t("Testi e documenti"), "scansioni": t("Scansioni e foto"),
+                "audio": t("Audio"), "posta": t("Posta"), "web": t("Pagine web"),
+                "fogli": t("Fogli di calcolo")}
+        tutti = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTENSIONS))
+        gruppi = [f"{nomi.get(k, k)} ({' '.join(f'*{e}' for e in v)})"
+                  for k, v in FORMAT_GROUPS.items()]
+        return ";;".join([f"{t('Tutti i formati importabili')} ({tutti})", *gruppi,
+                          f"{t('Tutti i file')} (*)"])
+
+    def _save_audio_device(self) -> None:
+        active = self._active_silent()
+        if not active:
+            return
+        slug, _ppaths = active
+        cfg = self.pm.config_for(slug)
+        scelta = self.audio_device.currentData() or "cpu"
+        if cfg.chunking.audio_device != scelta:
+            cfg.chunking.audio_device = scelta
+            self.pm.save_config_for(slug, cfg)
+
     def _add_files(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(self, t("Scegli file"))
+        files, _ = QFileDialog.getOpenFileNames(self, t("Scegli file"), "", self._import_filter())
         for f in files:
             self._selected_paths.append(Path(f))
             self.paths_list.addItem(f)
@@ -869,14 +1117,28 @@ class MainWindow(QMainWindow):
         cfg = self.pm.config_for(slug)
         paths = list(self._selected_paths)
         recursive = self.recursive_cb.isChecked()
+        dispositivo = self.audio_device.currentData() or cfg.chunking.audio_device
 
-        def job() -> str:
+        def job(p, n) -> str:
+            # OCR e trascrizione sono lunghi: l'avanzamento dice a che file e a che pagina o
+            # minuto si è, invece di una barra ferma
+            def avanza(fatti: int, totale: int, nota: str = "") -> None:
+                p(fatti, totale)
+                if nota:
+                    n(nota)
+
             report = pipeline.ingest_paths(
-                paths, db_path=ppaths.db, target_tokens=cfg.chunking.target_tokens, recursive=recursive
+                paths, db_path=ppaths.db, target_tokens=cfg.chunking.target_tokens,
+                recursive=recursive, progress=avanza, dispositivo_audio=dispositivo,
             )
-            return report.summary()
+            testo = report.summary()
+            if report.warnings:
+                testo += "\n" + "\n".join(f"• {Path(f).name}: {a}" for f, a in report.warnings[:12])
+            return testo
 
-        self._run_bg(job, lambda s: (self.ingest_result.setText(s), self._refresh_project_info()), "Importo i testi…")
+        self._run_bg(job, lambda s: (self.ingest_result.setText(s), self._refresh_project_info()),
+                     "Importo i testi…", progressable=True,
+                     on_note=lambda nota: self.ingest_result.setText(str(nota)))
 
     # ------------------------------------------------------------------ #
     #  tab: memoria
@@ -896,6 +1158,16 @@ class MainWindow(QMainWindow):
              t("Taglia i testi in sezioni ai confini dei paragrafi e fa descrivere ognuna dal modello (titolo, temi, persone). Il testo non viene mai riscritto."),
              self._do_atomize),
             (t("Collega le idee"), t("Costruisce la rete tematica che unisce idee affini."), self._do_graph),
+            (t("Fondi le idee doppie"),
+             t("Trova le idee che dicono la stessa cosa con parole diverse e le fonde in una: "
+               "i dettagli in più si conservano, e ogni fusione si può annullare."),
+             self._do_dedup),
+            (t("Trova i legami logici"),
+             t("Per le idee vicine chiede al modello se una è causa, seguito, esempio o "
+               "smentita dell'altra. Le contraddizioni si mostrano alla fine."),
+             self._do_typed_links),
+            (t("Fusioni fatte…"), t("Le idee fuse, con il perché: puoi annullarne una."),
+             self._show_merges),
             (t("Esporta archivio navigabile"), t("Crea un archivio HTML con pagine e grafo delle idee."), self._do_export_wiki),
             (t("Aggiorna conteggi"), t("Ricalcola documenti, blocchi, idee e collegamenti."), lambda: self._refresh_mem_stats()),
         ]:
@@ -1143,6 +1415,89 @@ class MainWindow(QMainWindow):
 
         self._run_bg(job, done, "Collego le idee…", progressable=True)
 
+    def _do_dedup(self) -> None:
+        active = self._active()
+        if not active:
+            return
+        slug, ppaths = active
+        cfg = self.pm.config_for(slug)
+        client = self._client(slug)
+        self._run_bg(
+            lambda p: deduplicate_nodes(
+                ppaths.db, ppaths.vectors, client, model=cfg.llm.models.reasoning,
+                language=cfg.project.language, embed_model_id=cfg.llm.models.embedding,
+                progress=p),
+            lambda rep: self._mem_done(t("Idee doppie: {0}").format(rep.summary())),
+            "Cerco le idee doppie…", progressable=True)
+
+    def _do_typed_links(self) -> None:
+        active = self._active()
+        if not active:
+            return
+        slug, ppaths = active
+        cfg = self.pm.config_for(slug)
+        client = self._client(slug)
+
+        def done(rep) -> None:
+            self._mem_done(t("Legami logici: {0}").format(rep.summary()))
+            contrari = contradictions(ppaths.db)
+            if contrari:
+                righe = "\n\n".join(f"• «{c['src_summary']}»\n  ↔ «{c['dst_summary']}»"
+                                     + (f"\n  {c.get('rationale', '')}" if c.get("rationale")
+                                        else "") for c in contrari[:15])
+                QMessageBox.information(self, t("Idee che si contraddicono"), t(
+                    "Queste idee dicono cose opposte: decidi tu quale tenere, o come "
+                    "raccontarle insieme.") + "\n\n" + righe)
+
+        self._run_bg(
+            lambda p: build_typed_links(
+                ppaths.db, ppaths.vectors, client, model=cfg.llm.models.reasoning,
+                language=cfg.project.language, embed_model_id=cfg.llm.models.embedding,
+                progress=p),
+            done, "Cerco i legami logici fra le idee…", progressable=True)
+
+    def _show_merges(self) -> None:
+        active = self._active()
+        if not active:
+            return
+        _slug, ppaths = active
+        fusioni = list_merges(ppaths.db)
+        if not fusioni:
+            QMessageBox.information(self, t("Fusioni fatte…"), t("Nessuna idea è stata fusa."))
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(t("Fusioni fatte…"))
+        dlg.resize(760, 520)
+        lay = QVBoxLayout(dlg)
+        elenco = QListWidget()
+        for f in fusioni:
+            voce = (f"#{f['kept_node_id']} ← «{(f['merged_summary'] or f['merged_text'])[:110]}»"
+                    + (f" — {f['reason']}" if f.get("reason") else ""))
+            elenco.addItem(voce)
+        lay.addWidget(elenco, 1)
+        bottoni = QHBoxLayout()
+        annulla = QPushButton(t("Annulla questa fusione"))
+        annulla.setMinimumHeight(44)
+        chiudi = QPushButton(t("Chiudi"))
+        chiudi.setMinimumHeight(44)
+        bottoni.addWidget(annulla)
+        bottoni.addStretch(1)
+        bottoni.addWidget(chiudi)
+        lay.addLayout(bottoni)
+
+        def ripristina() -> None:
+            riga = elenco.currentRow()
+            if riga < 0:
+                return
+            nuovo = restore_merge(ppaths.db, int(fusioni[riga]["merge_id"]), ppaths.vectors)
+            elenco.takeItem(riga)
+            fusioni.pop(riga)
+            self._mem_done(t("Fusione annullata: l'idea è tornata (#{0}).").format(nuovo))
+
+        annulla.clicked.connect(ripristina)
+        chiudi.clicked.connect(dlg.accept)
+        dlg.exec()
+
     def _do_export_wiki(self) -> None:
         active = self._active()
         if not active:
@@ -1198,6 +1553,7 @@ class MainWindow(QMainWindow):
         self.ordering_combo.addItem(t("in ordine di tempo"), "chronological")
         self.ordering_combo.addItem(t("come un racconto (arco narrativo)"), "narrative")
         self.ordering_combo.addItem(t("con un mio criterio"), "custom")
+        self.ordering_combo.addItem(t("dallo scopo e dal lettore"), "purpose")
         row.addWidget(self.ordering_combo)
         row.addWidget(QLabel(t("Numero di capitoli (0 = automatico):")))
         self.chapters_spin = QSpinBox()
@@ -1219,6 +1575,25 @@ class MainWindow(QMainWindow):
         self.criterion_edit.setPlaceholderText(t("es. per luogo, per personaggio, domanda→risposta…"))
         crit_row.addWidget(self.criterion_edit, 1)
         lay.addLayout(crit_row)
+        scopo_row = QHBoxLayout()
+        scopo_row.addWidget(QLabel(t("Scopo del libro:")))
+        self.purpose_edit = QLineEdit()
+        self.purpose_edit.setPlaceholderText(t("es. insegnare a coltivare un orto in balcone"))
+        scopo_row.addWidget(self.purpose_edit, 1)
+        scopo_row.addWidget(QLabel(t("Lettore:")))
+        self.reader_edit = QLineEdit()
+        self.reader_edit.setPlaceholderText(t("es. principianti in città, poco tempo"))
+        scopo_row.addWidget(self.reader_edit, 1)
+        lay.addLayout(scopo_row)
+        stile_row = QHBoxLayout()
+        stile_row.addWidget(QLabel(t("Stile dei titoli e delle transizioni:")))
+        self.organize_style_combo = QComboBox()
+        self.organize_style_combo.setToolTip(t(
+            "Lo stile con cui si scrivono i titoli dei capitoli e, con «dallo scopo e dal "
+            "lettore», obiettivi e passaggi fra i capitoli. Resta legato alla struttura e la "
+            "stesura in prosa lo ripropone."))
+        stile_row.addWidget(self.organize_style_combo, 1)
+        lay.addLayout(stile_row)
         lay.addWidget(QLabel(t("② Genera il libro")))
         exp = QHBoxLayout()
         exp.addWidget(QLabel(t("Formato:")))
@@ -1269,8 +1644,12 @@ class MainWindow(QMainWindow):
         _slug, ppaths = active
         self.compose_style_combo.clear()
         self.compose_style_combo.addItem(t("— prosa chiara —"), None)
+        self.organize_style_combo.clear()
+        self.organize_style_combo.addItem(t("— nessuno stile —"), None)
         for r in project_schema.list_styles(ppaths.db):
             self.compose_style_combo.addItem(t("{0} ({1})").format(r['name'], r['origin']), r["id"])
+            self.organize_style_combo.addItem(t("{0} ({1})").format(r['name'], r['origin']),
+                                              r["id"])
         spec = project_schema.get_bookspec(ppaths.db)
         if spec.target_words and not self.compose_target.text().strip():
             self.compose_target.setText(str(spec.target_words))
@@ -1365,19 +1744,35 @@ class MainWindow(QMainWindow):
         if ordering == "custom" and not criterion:
             QMessageBox.warning(self, t("Manca il criterio"), t("Hai scelto «con un mio criterio»: scrivi qual è nel campo apposito."))
             return
+        scopo, lettore = self.purpose_edit.text().strip(), self.reader_edit.text().strip()
+        if ordering == "purpose" and not (scopo and lettore):
+            QMessageBox.warning(self, t("Mancano scopo e lettore"), t(
+                "Hai scelto «dallo scopo e dal lettore»: scrivi a che cosa serve il libro e per "
+                "chi è."))
+            return
+        stile_id = self.organize_style_combo.currentData()
+        contratto = style_contract_for(ppaths.db, stile_id)
+        stile = {"style_contract": contratto, "style_profile_id": stile_id}
 
         def job(p) -> str:
             if ordering == "thematic":
                 rep = organize_thematic(
                     ppaths.db, ppaths.vectors, method=method, chapters=chapters,
-                    client=client, model=model, language=language, progress=p,
+                    client=client, model=model, language=language, progress=p, **stile,
                 )
             elif ordering == "chronological":
                 rep = organize_chronological(ppaths.db, chapters=chapters)
             elif ordering == "narrative":
-                rep = organize_narrative(ppaths.db, ppaths.vectors, client, chapters=chapters, model=model)
+                rep = organize_narrative(ppaths.db, ppaths.vectors, client, chapters=chapters,
+                                         model=model, **stile)
+            elif ordering == "purpose":
+                rep = organize_purpose(ppaths.db, client, scopo, lettore, chapters=chapters,
+                                       model=model, language=language, progress=p, **stile)
+                if rep.gaps:
+                    return t("{0} (ordinamento: {1})").format(rep.summary(), ordering) + "\n" + t(
+                        "Capitoli previsti senza materiale: {0}").format(", ".join(rep.gaps))
             else:
-                rep = organize_custom(ppaths.db, client, criterion, model=model)
+                rep = organize_custom(ppaths.db, client, criterion, model=model, **stile)
             return t("{0} (ordinamento: {1})").format(rep.summary(), ordering)
 
         self._run_bg(job, lambda s: self.statusBar().showMessage(s), "Raggruppo in capitoli…", progressable=True)
@@ -1522,6 +1917,9 @@ class MainWindow(QMainWindow):
         self._run_bg(
             lambda p: subdivide_sections(
                 ppaths.db, ppaths.vectors, oid, client=client, model=model, progress=p,
+                language=self.pm.config_for(slug).project.language,
+                style_contract=style_contract_for(ppaths.db,
+                                                  self.organize_style_combo.currentData()),
             ),
             lambda r: QMessageBox.information(self, t("Sezioni"), t("Create {0} sezioni (visibili in export/stesura).").format(r['sections'])),
             "Divido i capitoli in sezioni…",
@@ -1565,6 +1963,8 @@ class MainWindow(QMainWindow):
             lambda p: retitle_outline(
                 ppaths.db, int(oid), client, model=cfg.llm.models.reasoning,
                 language=cfg.project.language, progress=p,
+                style_contract=style_contract_for(ppaths.db,
+                                                  self.organize_style_combo.currentData()),
             ),
             lambda k: (self._load_outline_tree(), self.statusBar().showMessage(
                 t("Rigenerati i titoli di {0} capitoli.").format(k))),
@@ -1677,16 +2077,32 @@ class MainWindow(QMainWindow):
         if not active:
             return
         slug, ppaths = active
-        file, _ = QFileDialog.getOpenFileName(self, "Testo campione")
+        file, _ = QFileDialog.getOpenFileName(
+            self, t("Testo campione"), "",
+            t("Documenti") + " (*.txt *.md *.markdown *.text *.pdf *.docx *.epub);;"
+            + t("Tutti i file") + " (*)")
         if not file:
             return
         name, ok = QInputDialog.getText(self, t("Nome profilo"), t("Nome:"))
         if not ok or not name.strip():
             return
         client, model = self._client(slug), self.pm.config_for(slug).llm.models.reasoning
-        text = Path(file).read_text(encoding="utf-8", errors="replace")
 
         def job():
+            # PDF, DOCX ed EPUB passano dal caricatore dei documenti: letti come testo semplice
+            # diventerebbero byte senza senso. Il campione si prende lungo tutto il testo, non
+            # dalle prime pagine.
+            try:
+                text = load_document(file).raw_text
+            except Exception:  # noqa: BLE001 - un formato non riconosciuto si prova come testo
+                text = Path(file).read_text(encoding="utf-8", errors="replace")
+            brani, brano = [], ""
+            for capoverso in (p for p in text.split("\n\n") if p.strip()):
+                brano = f"{brano}\n\n{capoverso}" if brano else capoverso
+                if len(brano) >= 3000:
+                    brani.append(brano)
+                    brano = ""
+            text = campione_rappresentativo(brani + [brano] if brano else brani) or text
             prof = extract_style(text, client, name=name.strip(), model=model)
             project_schema.save_style(ppaths.db, prof.name, prof.origin, prof.model_dump())
             return prof.name
@@ -1727,15 +2143,30 @@ class MainWindow(QMainWindow):
         if not ok2 or not specs_text.strip():
             return
         specs: list[AuthorWeight] = []
+        ignote: list[str] = []
         for line in specs_text.splitlines():
             line = line.strip()
             if not line:
                 continue
             parts = line.split(":")
             author = parts[0].strip()
-            weight = float(parts[1]) if len(parts) > 1 and parts[1] else 1.0
-            dims = [d.strip() for d in parts[2].split(",")] if len(parts) > 2 and parts[2] else []
-            specs.append(AuthorWeight(author=author, weight=weight, dims=dims))
+            try:
+                weight = float(parts[1].replace(",", ".")) if len(parts) > 1 and parts[1] else 1.0
+            except ValueError:
+                weight = 1.0
+            dims = []
+            for d in (parts[2].split(",") if len(parts) > 2 and parts[2] else []):
+                chiave = _STYLE_DIM_ALIASES.get(d.strip().lower(), d.strip().lower())
+                if chiave in STYLE_DIMENSIONS:
+                    dims.append(chiave)
+                elif d.strip():
+                    ignote.append(d.strip())
+            specs.append(AuthorWeight(author=author, weight=max(0.0, weight), dims=dims))
+        if ignote:
+            # una dimensione che lo stile non conosce non entrerebbe nella fusione: lo si dice
+            QMessageBox.information(self, t("Dimensioni non riconosciute"), t(
+                "Queste dimensioni non esistono e sono ignorate: {0}. Quelle valide: {1}.").format(
+                ", ".join(ignote), ", ".join(STYLE_DIMENSIONS)))
         client, model = self._client(slug), self.pm.config_for(slug).llm.models.reasoning
 
         def job():
@@ -1898,6 +2329,26 @@ class MainWindow(QMainWindow):
         self.rw_format = self._format_combo()
         row.addWidget(self.rw_format)
         lay.addLayout(row)
+        forma = QHBoxLayout()
+        forma.addWidget(QLabel(t("Forma:")))
+        self.rw_form = QComboBox()
+        self.rw_form.addItem(t("Conserva la forma (stessi paragrafi)"), FORM_KEEP)
+        self.rw_form.addItem(t("Dai versi alla prosa"), FORM_PROSE_FROM_VERSE)
+        self.rw_form.setToolTip(t(
+            "In prosa i capitoli (canti, sezioni) restano gli stessi per numero e contenuto; "
+            "cambiano lunghezza e stile dei paragrafi. Il testo si divide in unità che stanno "
+            "nel limite di una risposta del modello."))
+        self.rw_form.setMinimumHeight(44)
+        forma.addWidget(self.rw_form)
+        self.rw_modernize = QCheckBox(t("Modernizza la lingua"))
+        self.rw_modernize.setToolTip(t(
+            "Grammatica, sintassi e lessico di oggi, conservando la voce dell'autore: "
+            "immagini, metafore, tono. Con «Dai versi alla prosa»: la Commedia in prosa moderna "
+            "nello stile di Dante."))
+        self.rw_modernize.setMinimumHeight(44)
+        forma.addWidget(self.rw_modernize)
+        forma.addStretch(1)
+        lay.addLayout(forma)
         btns = QHBoxLayout()
         prev_btn = QPushButton(t("Anteprima (primo capitolo)"))
         prev_btn.clicked.connect(self._do_rewrite_preview)
@@ -1947,7 +2398,7 @@ class MainWindow(QMainWindow):
         if not active:
             return
         slug, ppaths = active
-        files, _ = QFileDialog.getOpenFileNames(self, t("Scegli file"))
+        files, _ = QFileDialog.getOpenFileNames(self, t("Scegli file"), "", self._import_filter())
         if not files:
             return
         paths = [Path(f) for f in files]
@@ -2057,11 +2508,13 @@ class MainWindow(QMainWindow):
         if not setup:
             return
         _slug, ppaths, contract, doc_id, ratio, client, model, _doc, _stile, _lingua, critic, critic_model, stile_id = setup
+        forma, moderna = self.rw_form.currentData(), self.rw_modernize.isChecked()
 
         def job(p):
             rep = rewrite_document(
                 ppaths.db, doc_id, contract, client, kind="preview", ratio=ratio, model=model,
                 resume=False, progress=p, critic=critic, critic_model=critic_model,
+                form=forma, modernize=moderna,
             )
             return preview_pairs(ppaths.db, rep.run_id)
 
@@ -2084,12 +2537,13 @@ class MainWindow(QMainWindow):
         )
         if out is None:
             return
+        forma, moderna = self.rw_form.currentData(), self.rw_modernize.isChecked()
 
         def job(p):
             rep = rewrite_document(
                 ppaths.db, doc_id, contract, client, kind="full", ratio=ratio, model=model,
                 progress=p, critic=critic, critic_model=critic_model,
-                style_profile_id=stile_id,
+                style_profile_id=stile_id, form=forma, modernize=moderna,
                 should_stop=lambda: self._stop_requested,
             )
             if rep.stopped:
@@ -2119,12 +2573,126 @@ class MainWindow(QMainWindow):
         self._enqueue(QueuedBook(
             document_id=doc_id, title=documento, out_path=out, fmt=fmt, mode="rewrite",
             contract=contract, style_name=stile, style_profile_id=stile_id,
-            ratio=ratio, critic=critic,
+            ratio=ratio, critic=critic, form=self.rw_form.currentData(),
+            modernize=self.rw_modernize.isChecked(),
         ))
 
     # ------------------------------------------------------------------ #
     #  tab: translate (modalità C)
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    #  domande dal lavoro in corso (modi di dire)
+    # ------------------------------------------------------------------ #
+    def _answer_in_gui(self, domanda: dict) -> None:
+        try:
+            domanda["risposta"] = domanda["fn"]()
+        except Exception as exc:  # noqa: BLE001 - una finestra rotta non ferma la traduzione
+            domanda["errore"] = str(exc)
+        finally:
+            domanda["fatto"].set()
+
+    def _ask_in_gui(self, fn: Callable[[], Any]) -> Any:
+        """Dal thread di lavoro: esegue ``fn`` nella finestra e ne aspetta il risultato. Se
+        l'autore preme «Interrompi» mentre la domanda è aperta, il lavoro non resta appeso."""
+        if threading.current_thread() is threading.main_thread():
+            return fn()
+        domanda: dict[str, Any] = {"fn": fn, "fatto": threading.Event(), "risposta": None}
+        self._domande.chiedi.emit(domanda)
+        while not domanda["fatto"].wait(0.25):
+            if self._stop_requested:
+                return None
+        if "errore" in domanda:
+            raise RuntimeError(domanda["errore"])
+        return domanda["risposta"]
+
+    def _idiom_dialog(self, voce: dict, *, later: bool = True) -> Any:
+        """Un modo di dire o un riferimento culturale: l'autore sceglie la resa. Ritorna l'indice
+        dell'opzione, un testo scritto da lui, o ``None`` (deciderà dopo)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(t("Come rendere questo passaggio?"))
+        lay = QVBoxLayout(dlg)
+        tipo = str(voce.get("tipo") or "")
+        testa = QLabel(f"<b>«{html.escape(str(voce.get('originale') or ''))}»</b>"
+                       + (f" — {html.escape(tipo)}" if tipo else ""))
+        testa.setWordWrap(True)
+        lay.addWidget(testa)
+        if voce.get("contesto"):
+            contesto = QLabel(t("Nella frase: {0}").format(html.escape(str(voce["contesto"]))))
+            contesto.setWordWrap(True)
+            lay.addWidget(contesto)
+        gruppo = QButtonGroup(dlg)
+        for i, o in enumerate(voce.get("opzioni") or []):
+            o = o if isinstance(o, dict) else {"resa": str(o)}
+            b = QRadioButton(f"{o.get('resa', '')}" + (f"  ({o.get('tipo')})" if o.get("tipo")
+                                                         else ""))
+            b.setMinimumHeight(44)
+            if o.get("spiegazione"):
+                b.setToolTip(str(o["spiegazione"]))
+            gruppo.addButton(b, i)
+            lay.addWidget(b)
+            if o.get("spiegazione"):
+                nota = QLabel(str(o["spiegazione"]))
+                nota.setWordWrap(True)
+                nota.setIndent(28)
+                lay.addWidget(nota)
+            if i == 0:
+                b.setChecked(True)
+        libera = QLineEdit()
+        libera.setPlaceholderText(t("…oppure scrivi tu la resa"))
+        libera.setMinimumHeight(44)
+        lay.addWidget(libera)
+        silenzia = QCheckBox(t("Non chiedere più per questa traduzione (le altre restano da "
+                               "decidere dopo)"))
+        if later:
+            lay.addWidget(silenzia)
+        bottoni = QDialogButtonBox()
+        usa = bottoni.addButton(t("Usa questa resa"), QDialogButtonBox.ButtonRole.AcceptRole)
+        dopo = bottoni.addButton(t("Decidi dopo"), QDialogButtonBox.ButtonRole.RejectRole)
+        for b in (usa, dopo):
+            b.setMinimumHeight(44)
+        bottoni.accepted.connect(dlg.accept)
+        bottoni.rejected.connect(dlg.reject)
+        lay.addWidget(bottoni)
+        esito = dlg.exec()
+        if silenzia.isChecked():
+            self._idioms_silenced = True
+        if esito != QDialog.DialogCode.Accepted:
+            return None
+        if libera.text().strip():
+            return libera.text().strip()
+        return gruppo.checkedId() if gruppo.checkedId() >= 0 else None
+
+    def _decide_idiom(self, voce: dict) -> Any:
+        """Il ``decide_idiom`` della traduzione: gira nel thread di lavoro."""
+        if self._idioms_silenced or self._stop_requested:
+            return None
+        return self._ask_in_gui(lambda: self._idiom_dialog(voce))
+
+    def _translate_pending_idioms(self) -> None:
+        """I modi di dire rimasti da decidere nell'ultima traduzione: si decidono adesso, e i
+        brani che li contengono si ritraducono alla ripresa."""
+        if self._last_translation is None:
+            QMessageBox.information(self, t("Modi di dire"), t(
+                "Nessuna traduzione in questa sessione: avviane una (anche l'anteprima)."))
+            return
+        db, run_id = self._last_translation
+        voci = idiom_decisions(db, run_id, pending_only=True)
+        if not voci:
+            QMessageBox.information(self, t("Modi di dire"),
+                                    t("Nessun modo di dire in attesa di una decisione."))
+            return
+        risposte: dict[str, Any] = {}
+        for voce in voci:
+            r = self._idiom_dialog(voce, later=False)
+            if r is not None:
+                risposte[str(voce.get("chiave"))] = r
+        if not risposte:
+            return
+        riaperti = answer_idioms(db, run_id, risposte)
+        QMessageBox.information(self, t("Modi di dire"), t(
+            "{0} decisioni registrate, {1} brani riaperti: premi «Traduci tutto il libro» per "
+            "ritradurli con le rese scelte.").format(len(risposte), riaperti))
+
     def _tab_translate(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -2155,6 +2723,33 @@ class MainWindow(QMainWindow):
         self.tr_format = self._format_combo()
         row.addWidget(self.tr_format)
         lay.addLayout(row)
+        opzioni = QHBoxLayout()
+        self.tr_literary = QCheckBox(t("Traduzione letteraria"))
+        self.tr_literary.setToolTip(t(
+            "Cerca modi di dire, giochi di parole e riferimenti culturali e propone come "
+            "renderli; se non scegli uno stile, usa quello dell'originale."))
+        self.tr_literary.setChecked(True)
+        self.tr_ask_idioms = QCheckBox(t("Chiedimi come rendere i modi di dire"))
+        self.tr_ask_idioms.setToolTip(t(
+            "Durante la traduzione si apre una finestra con le opzioni di resa. Senza, la "
+            "traduzione continua e le decisioni restano da prendere dopo."))
+        self.tr_ask_idioms.setChecked(True)
+        self.tr_idiom_notes = QCheckBox(t("Fra le opzioni anche la nota del traduttore"))
+        self.tr_polish = QCheckBox(t("Rifinitura madrelingua"))
+        self.tr_polish.setToolTip(t(
+            "Un secondo passaggio corregge calchi, falsi amici e ritmo senza cambiare il "
+            "senso. Si scarta se cambia troppo la lunghezza o l'impaginazione."))
+        self.tr_polish.setChecked(True)
+        for c in (self.tr_literary, self.tr_ask_idioms, self.tr_idiom_notes, self.tr_polish):
+            c.setMinimumHeight(44)
+            opzioni.addWidget(c)
+        self.tr_literary.toggled.connect(lambda on: [c.setEnabled(on) for c in (
+            self.tr_ask_idioms, self.tr_idiom_notes, self.tr_polish)])
+        pendenti = QPushButton(t("Modi di dire da decidere…"))
+        pendenti.clicked.connect(self._translate_pending_idioms)
+        opzioni.addWidget(pendenti)
+        opzioni.addStretch(1)
+        lay.addLayout(opzioni)
         btns = QHBoxLayout()
         prev_btn = QPushButton(t("Anteprima (primo capitolo)"))
         prev_btn.clicked.connect(lambda: self._do_translate(preview=True))
@@ -2225,7 +2820,8 @@ class MainWindow(QMainWindow):
         self._enqueue(QueuedBook(
             document_id=doc_id, title=documento, out_path=out, fmt=fmt, mode="translate",
             contract=contract, target_language=lang, style_profile_id=stile_id,
-            critic=self.tr_critic.isChecked(),
+            critic=self.tr_critic.isChecked(), literary=self.tr_literary.isChecked(),
+            polish=self.tr_literary.isChecked() and self.tr_polish.isChecked(),
         ))
 
     def _do_translate(self, *, preview: bool) -> None:
@@ -2247,13 +2843,22 @@ class MainWindow(QMainWindow):
             if out is None:
                 return
 
+        letteraria = self.tr_literary.isChecked()
+        chiedi = letteraria and self.tr_ask_idioms.isChecked()
+        self._idioms_silenced = False
+
         def job(p):
             rep = rewrite_document(
                 ppaths.db, int(doc_id), contract, client, progress=p,
                 critic=self.tr_critic.isChecked(), critic_model=critic_model,
                 kind=kind, mode="translate", target_language=lang, model=model, resume=not preview,
                 style_profile_id=stile_id, should_stop=lambda: self._stop_requested,
+                literary=letteraria, idioms=letteraria,
+                idiom_notes=letteraria and self.tr_idiom_notes.isChecked(),
+                decide_idiom=self._decide_idiom if chiedi else None,
+                polish=letteraria and self.tr_polish.isChecked(),
             )
+            self._last_translation = (ppaths.db, rep.run_id)
             if preview:
                 return ("preview", preview_pairs(ppaths.db, rep.run_id))
             if rep.stopped:
@@ -2319,7 +2924,7 @@ class MainWindow(QMainWindow):
         """Rilegge il libro solo quando serve: scheda aperta, «segui» attivo, lavoro in corso."""
         if not hasattr(self, "read_view") or not self.read_follow.isChecked():
             return
-        if self.tabs.currentWidget() is not self.read_view.parentWidget():
+        if not self.read_view.isVisible():
             return  # nessuno sta guardando: non si legge il disco per niente
         self._refresh_reading()
 
@@ -2331,7 +2936,7 @@ class MainWindow(QMainWindow):
         if not attivo:
             return
         _slug, ppaths = attivo
-        sorgenti = preview.sources(ppaths.db)
+        sorgenti = preview.sources(ppaths.db, preview.forge_roots(ppaths))
         scelta = self.read_combo.currentData()
         if forza or [s.ident for s in sorgenti] != [
             self.read_combo.itemData(i) and self.read_combo.itemData(i)[1]
@@ -2373,7 +2978,7 @@ class MainWindow(QMainWindow):
             return
         _slug, ppaths = attivo
         sorgente = next(
-            (s for s in preview.sources(ppaths.db)
+            (s for s in preview.sources(ppaths.db, preview.forge_roots(ppaths))
              if (s.kind, s.ident) == self.read_combo.currentData()), None
         )
         if sorgente is None:
@@ -2725,6 +3330,7 @@ class MainWindow(QMainWindow):
         self._chat_queue: list[tuple[str, str]] = []  # (progetto, testo) in attesa di partire
         self._style_pending = False
         self._chat_slug = ""  # il libro di cui l'assistente sta parlando, mentre lavora
+        self._chat_mode = ""  # e quale lavoro: da zero, completa, aggiorna
         self._chat_key: tuple = ()
         self._fg_shown_phase = ""
 
@@ -2876,6 +3482,23 @@ class MainWindow(QMainWindow):
                                              "conversazione."))
         self.fg_notebook_toggle.toggled.connect(self.fg_chat.show_notebook)
         riga.addWidget(self.fg_notebook_toggle)
+        self.fg_surprise = QPushButton(t("Sorpresa…"))
+        self.fg_surprise.setToolTip(t(
+            "Scrivi in poche righe cosa deve raccontare il libro: tutto il resto — personaggi, "
+            "trama, struttura, ricerca, stesura, impaginazione — lo decide l'assistente. Puoi "
+            "fermarlo quando vuoi e riprendere."))
+        self.fg_surprise.clicked.connect(self._forge_surprise)
+        self._forge_cmd("interview.surprise", self.fg_surprise)
+        riga.addWidget(self.fg_surprise)
+        self.fg_manuscript = QPushButton(t("Carica il manoscritto…"))
+        self.fg_manuscript.setToolTip(t(
+            "Il libro da completare o da aggiornare (docx, pdf, md, txt, epub). Si divide in "
+            "capitoli, l'originale resta intatto; ne ricavo il quaderno, il registro capitolo per "
+            "capitolo e la voce dell'autore."))
+        self.fg_manuscript.clicked.connect(self._forge_load_manuscript)
+        self._forge_cmd("interview.manuscript", self.fg_manuscript)
+        self.fg_manuscript.setVisible(False)
+        riga.addWidget(self.fg_manuscript)
         fine = QPushButton(t("Ho finito: decidi tu il resto"))
         fine.setMinimumHeight(44)
         fine.setToolTip(t("Chiude la conversazione. L'assistente completa il quaderno, scioglie "
@@ -2966,11 +3589,11 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         riga = QHBoxLayout()
         uno = QPushButton(t("Scrivi il prossimo capitolo"))
-        uno.clicked.connect(self._forge_write_next)
+        uno.clicked.connect(lambda: self._forge_write_next())
         self._forge_cmd("writing.next", uno)
         riga.addWidget(uno)
         tutti = QPushButton(t("Scrivi tutti i capitoli"))
-        tutti.clicked.connect(self._forge_write_all)
+        tutti.clicked.connect(lambda: self._forge_write_all())
         self._forge_cmd("writing.all", tutti)
         riga.addWidget(tutti)
         corti = QPushButton(t("Riscrivi i capitoli troppo corti"))
@@ -2992,6 +3615,44 @@ class MainWindow(QMainWindow):
         self._forge_cmd("writing.matter", scrivi)
         seconda.addWidget(scrivi)
         lay.addLayout(seconda)
+
+        # Le prove e i registri: per rifare un capitolo senza toccarlo e per vedere com'è andata.
+        terza = QHBoxLayout()
+        terza.addWidget(QLabel(t("Capitolo:")))
+        self.fg_trial_chapter = QSpinBox()
+        self.fg_trial_chapter.setRange(1, 999)
+        self.fg_trial_chapter.setMinimumHeight(44)
+        self.fg_trial_chapter.setAccessibleName(t("Numero del capitolo da riscrivere in prova"))
+        terza.addWidget(self.fg_trial_chapter)
+        prova = QPushButton(t("Riscrivi in prova"))
+        prova.setToolTip(t("Riscrive il capitolo con il piano delle scene e la revisione "
+                           "editoriale in output/prove/: il capitolo scritto non si tocca."))
+        prova.clicked.connect(lambda: self._forge_write_trial())
+        self._forge_cmd("writing.trial", prova)
+        terza.addWidget(prova)
+        registro = QPushButton(t("Ricostruisci il registro"))
+        registro.setToolTip(t("Ricava dai capitoli scritti il registro della continuità: dove "
+                              "finisce ogni capitolo, cosa sa già il lettore, i motivi e le "
+                              "invenzioni (story/ledger.md)."))
+        registro.clicked.connect(self._forge_rebuild_ledger)
+        self._forge_cmd("writing.ledger", registro)
+        terza.addWidget(registro)
+        self.fg_update_doc = QPushButton(t("Documento delle modifiche"))
+        self.fg_update_doc.setToolTip(t(
+            "Il libro con ogni modifica segnata, capitolo per capitolo (DOCX e HTML), e il "
+            "resoconto: per ogni cambiamento, dove ha avuto effetto e perché."))
+        self.fg_update_doc.clicked.connect(self._forge_update_document)
+        self._forge_cmd("writing.update_doc", self.fg_update_doc)
+        self.fg_update_doc.setVisible(False)
+        terza.addWidget(self.fg_update_doc)
+        resoconti = QPushButton(t("Apri i resoconti editoriali"))
+        resoconti.setToolTip(t("Capitolo per capitolo: l'esito della revisione editoriale, quelli "
+                               "da rivedere, e i collegamenti al resoconto e al piano delle scene."))
+        resoconti.clicked.connect(self._forge_open_reports)
+        self._forge_cmd("writing.reports", resoconti)
+        terza.addWidget(resoconti)
+        terza.addStretch(1)
+        lay.addLayout(terza)
         return w
 
     def _panel_production(self) -> QWidget:
@@ -3076,7 +3737,8 @@ class MainWindow(QMainWindow):
             return None
         cfg = self.pm.config_for(slug)
         return open_forge(self.pm.paths(slug), cfg,
-                          client=self._client(slug) if with_client else None)
+                          client=self._client(slug) if with_client else None,
+                          mode=self._forge_mode)
 
     @staticmethod
     def _cover_label(controllo) -> str:
@@ -3176,7 +3838,7 @@ class MainWindow(QMainWindow):
         vista = self.fg_chat.view
         vista.clear()
         if not forge.state.transcript:
-            vista.add_message("assistant", t(iv.OPENING))
+            vista.add_message("assistant", t(iv.opening_for(forge.state)))
         for battuta in forge.state.transcript:
             vista.add_message("user" if battuta.get("role") == "user" else "assistant",
                               battuta.get("text", ""))
@@ -3186,12 +3848,15 @@ class MainWindow(QMainWindow):
 
     def _forge_paint(self, forge) -> None:
         """Colora le pastiglie, apre il pannello della fase corrente, aggiorna le etichette."""
+        if getattr(forge, "mode", "nuovo") != self._forge_mode:
+            return  # un lavoro finito su un altro libro (completa/aggiorna): non è questa vista
         fasi = forge.phases()
-        for info in fasi:
+        for numero, info in enumerate(fasi, 1):
             bottone = self.fg_phase_buttons.get(info.id)
             if bottone is None:
                 continue
-            bottone.setStyleSheet(self._PHASE_STYLE.get(info.state, ""))
+            bottone.setText(f"{numero} · {t(info.title)}")
+            bottone.setStyleSheet(theme.phase_qss(info.state))
             bottone.setToolTip(f"{t(info.state)} — {info.detail}")
         corrente = next((i for i, f in enumerate(fasi) if f.id == forge.state.phase), 0)
         self.fg_panels.setCurrentIndex(corrente)
@@ -3214,6 +3879,9 @@ class MainWindow(QMainWindow):
                 self.fg_log.setMarkdown(forge.project.spec_path.read_text(encoding="utf-8"))
             self._forge_center(log=forge.state.phase != "interview")
         self.fg_read_spec.setEnabled(forge.project.spec_path.exists())
+        self.fg_manuscript.setVisible(forge.from_manuscript)
+        self.fg_surprise.setVisible(forge.mode == "nuovo")
+        self.fg_update_doc.setVisible(forge.mode == "aggiorna")
 
         facts = pg.read_facts(forge)
         self._forge_style_commands(forge, facts)
@@ -3418,10 +4086,7 @@ class MainWindow(QMainWindow):
 
     def _forge_open_settings(self) -> None:
         """Porta alla scheda Impostazioni, dove si accende la ricerca sul web."""
-        for indice, (aggiorna, _) in enumerate(self._tab_refreshers):
-            if aggiorna == self._refresh_settings:
-                self.tabs.setCurrentIndex(indice)
-                return
+        self._go_to_page(self._refresh_settings)
 
     def _forge_style_commands(self, forge, facts=None) -> None:
         """Colora i comandi di fase secondo lo stato: consigliato, disponibile o superato."""
@@ -3684,9 +4349,10 @@ class MainWindow(QMainWindow):
         if forge is None:
             return
         self._chat_slug = slug
+        self._chat_mode = self._forge_mode
         forge.state.style_id = int(self.fg_style.currentData() or 0)
         contratto = self._forge_style_contract(forge)
-        apertura = t(iv.OPENING)
+        apertura = t(iv.opening_for(forge.state))
         bolla = self.fg_chat.view.begin_reply()
         self._chat_busy = True
         self.fg_chat.composer.set_streaming(True)
@@ -3744,11 +4410,14 @@ class MainWindow(QMainWindow):
             return
         self._forge_chat_reply(None)
 
-    def _forge_for(self, slug: str, *, with_client: bool = False):
-        """Il libro di un progetto preciso, che sia quello attivo o no."""
+    def _forge_for(self, slug: str, *, with_client: bool = False, mode: str | None = None):
+        """Il libro di un progetto preciso, che sia quello attivo o no. ``mode``: il lavoro
+        (da zero, completa, aggiorna); senza, quello della scheda aperta — ma chi risponde a una
+        conversazione cominciata in un'altra scheda passa il suo."""
         cfg = self.pm.config_for(slug)
         return open_forge(self.pm.paths(slug), cfg,
-                          client=self._client(slug) if with_client else None)
+                          client=self._client(slug) if with_client else None,
+                          mode=mode or self._forge_mode)
 
     def _forge_update_notebook(self, slug: str) -> None:
         """Dopo ogni risposta, il quaderno si mette al passo con la conversazione.
@@ -3757,7 +4426,7 @@ class MainWindow(QMainWindow):
         passati a un altro progetto, il quaderno da aggiornare resta quello del libro di cui si
         stava parlando.
         """
-        forge = self._forge_for(slug, with_client=True)
+        forge = self._forge_for(slug, with_client=True, mode=self._chat_mode or None)
         self._chat_busy = True
         self.fg_chat.set_notebook_status(t("aggiorno…"))
 
@@ -4067,24 +4736,17 @@ class MainWindow(QMainWindow):
         """Entrando nella fase Ricerca con la ricerca da fare, la fa partire.
 
         La ricerca non chiede scelte all'autore (stile, formati, copertina sì, questa no): farla
-        aspettare un clic è tempo perso. Con il web spento parte lo stesso, e il riquadro di stato
-        lo dice. Non riparte se è fatta o rinunciata; le altre fasi non partono mai da sole.
+        aspettare un clic è tempo perso. Parte da sola solo se non è già conclusa (fatta o
+        rinunciata) e se la fase prima è conclusa — specifica approvata, o chiusa a mano
+        dall'autore (vedi ``Forge.can_autostart_research``). Una ricerca finita non riparte mai
+        da sola; le altre fasi non partono mai da sole.
         """
-        st = forge.state
-        if st.phase != "research" or st.research_declined:
+        if forge.state.phase != "research" or not forge.can_autostart_research():
             return
-        vecchia = forge.research_format_old()
-        if st.research_done and not vecchia:
-            return
-        if not st.outline or self._workers or self._chat_busy:
+        if self._workers or self._chat_busy:
             return
         if self._fg_research_stopped == self.pm.active_slug():
             return  # l'autore l'ha interrotta: non si riparte da soli, c'è «Rifai la ricerca»
-        if vecchia:
-            # Una ricerca nel formato precedente (solo .md) non ha punti né questioni: si rifà
-            # tutta, e da adesso non vale più come fatta.
-            st.research_done = False
-            forge.save()
         self._forge_research_all(mode="resume")
 
     # ---- l'esploratore e le questioni aperte --------------------------------------
@@ -4315,6 +4977,10 @@ class MainWindow(QMainWindow):
             esito = q.outcome or {}
             riga = f"- **{parole.get(q.status, q.status)}** — " + t("capitolo {0}:").format(
                 q.chapter) + f" {q.text}"
+            if q.category:
+                from bookwriter.gui.research_view import category_words
+
+                riga += f" *({category_words().get(q.category, q.category)})*"
             if q.discarded:
                 riga += " → " + t("scartata")
             elif esito.get("kind") == rstore.OUT_SOURCE:
@@ -4775,7 +5441,71 @@ class MainWindow(QMainWindow):
         row = project_schema.get_style_row(self.pm.paths(self.pm.active_slug()).db, int(style_id))
         return build_style_contract(StyleProfile.model_validate(row["data"])) if row else ""
 
-    def _forge_write_next(self) -> None:
+    def _forge_plan_blocked(self, forge, numero: int, titolo: str, difetti: list[str],
+                            riprova: Callable[[str], None], *, trial: bool = False) -> None:
+        """Il piano di un capitolo ha difetti bloccanti: l'autore sceglie. Ripararlo solo dove ha
+        difetti (le scene sane restano), rifarlo da capo, procedere con una deroga motivata (che
+        resta registrata), o lasciar stare."""
+        elenco = "\n".join(f"• {d}" for d in difetti[:8])
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(t("Il piano ha difetti bloccanti"))
+        box.setText(t("Il capitolo {0} «{1}» non si scrive: il suo piano ha difetti che "
+                      "renderebbero la stesura incoerente.").format(numero, titolo))
+        box.setDetailedText(elenco)
+        box.setInformativeText(elenco[:900])
+        ripara = box.addButton(t("Ripara solo i difetti"), QMessageBox.ButtonRole.AcceptRole)
+        rifai = box.addButton(t("Ripianifica da capo"), QMessageBox.ButtonRole.ActionRole)
+        deroga = box.addButton(t("Procedi con una deroga…"), QMessageBox.ButtonRole.ActionRole)
+        box.addButton(t("Annulla"), QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(ripara)
+        box.exec()
+        if box.clickedButton() is ripara:
+            self._forge_repair_plan(forge, numero, titolo, riprova, trial=trial)
+        elif box.clickedButton() is rifai:
+            forge.replan_chapter(numero, trial=trial)
+            riprova("")
+        elif box.clickedButton() is deroga:
+            motivo, ok = QInputDialog.getMultiLineText(
+                self, t("Deroga"), t("Perché si scrive lo stesso? Il motivo resta registrato "
+                                     "nel piano e nello stato del libro."), "")
+            if ok and motivo.strip():
+                riprova(motivo.strip())
+
+    def _forge_repair_plan(self, forge, numero: int, titolo: str,
+                           riprova: Callable[[str], None], *, trial: bool = False) -> None:
+        """Ripara il piano bloccato solo dove ha difetti; pulito, la stesura riparte da lui, con
+        blocker ancora dentro si torna alla scelta."""
+        contratto = self._forge_style_contract(forge)
+        righe: list[str] = []
+
+        def nota(n) -> None:
+            if isinstance(n, tuple):
+                self._forge_note_detail(n)
+                return
+            righe.append(str(n))
+            self._forge_show("\n".join(f"- {r}" for r in righe))
+
+        def fatto(piano) -> None:
+            self._forge_paint(forge)
+            if piano is None:
+                QMessageBox.information(self, t("Piano non riparabile"), t(
+                    "Il piano del capitolo {0} non c'è più o ha già scene scritte: si "
+                    "ripianifica da capo.").format(numero))
+                forge.replan_chapter(numero, trial=trial)
+                riprova("")
+            elif piano.blockers():
+                self._forge_plan_blocked(forge, numero, titolo, piano.blockers(), riprova,
+                                         trial=trial)
+            else:
+                riprova("")
+
+        self._forge_job(
+            lambda p, n: forge.repair_plan(numero, trial=trial, style_contract=contratto, note=n),
+            fatto, "Riparo il piano…", progressable=True, on_note=nota,
+            activity=t("Sto riparando il piano solo dove ha difetti…"))
+
+    def _forge_write_next(self, *, waiver: str = "") -> None:
         forge = self._forge(with_client=True)
         if forge is None:
             return
@@ -4784,6 +5514,12 @@ class MainWindow(QMainWindow):
         def fatto(risultato) -> None:
             if risultato is None:
                 self._forge_say("assistant", t("Tutti i capitoli previsti sono già su disco."))
+            elif risultato.blocked:
+                self._forge_paint(forge)
+                self._forge_plan_blocked(
+                    forge, risultato.number, risultato.title, risultato.blocked,
+                    lambda motivo: self._forge_write_next(waiver=motivo))
+                return
             elif risultato.stopped:
                 self._forge_say("assistant", t(
                     "Fermato a metà capitolo: le sezioni scritte restano da parte e si "
@@ -4792,21 +5528,27 @@ class MainWindow(QMainWindow):
                 self._forge_say("assistant", t("Scritto su disco: {0}").format(risultato.line()))
             self._forge_paint(forge)
 
+        righe: list[str] = []
+
         def nota(n) -> None:
             if isinstance(n, tuple):
                 self._forge_note_detail(n)
+                return
+            righe.append(str(n))  # il piano, la revisione editoriale: si vede cosa succede
+            self._forge_show("\n".join(f"- {r}" for r in righe))
 
         self._forge_job(
-            lambda p, n: forge.write_next(style_contract=contratto, note=n,
+            lambda p, n: forge.write_next(style_contract=contratto, note=n, waiver=waiver,
                                           should_stop=lambda: self._stop_requested),
             fatto, "Scrivo il capitolo…", progressable=True, stoppable=True, on_note=nota,
             activity=t("Sto scrivendo il prossimo capitolo…"))
 
-    def _forge_write_all(self) -> None:
+    def _forge_write_all(self, *, waivers: dict[int, str] | None = None) -> None:
         forge = self._forge(with_client=True)
         if forge is None:
             return
         contratto = self._forge_style_contract(forge)
+        deroghe = dict(waivers or {})
         righe: list[str] = []
 
         def avanzamento(nota) -> None:
@@ -4819,14 +5561,234 @@ class MainWindow(QMainWindow):
         def fatto(report) -> None:
             self._forge_show(report.summary())
             self._forge_paint(forge)
+            if report.blocked:
+                numero, titolo, difetti = report.blocked
+
+                def riprova(motivo: str) -> None:
+                    if motivo:
+                        deroghe[numero] = motivo
+                    self._forge_write_all(waivers=deroghe)
+
+                self._forge_plan_blocked(forge, numero, titolo, difetti, riprova)
 
         self._forge_job(
             lambda p, n: forge.write_all(style_contract=contratto, progress=p, note=n,
+                                         waivers=deroghe,
                                          should_stop=lambda: self._stop_requested),
             fatto, "Scrivo i capitoli…", progressable=True, stoppable=True, on_note=avanzamento,
             activity=t("Sto scrivendo i capitoli…"),
             steps=t("Sto scrivendo il capitolo {0} di {1}…"),
         )
+
+    def _forge_surprise(self) -> None:
+        """«Sorpresa…»: una descrizione minima, e il libro intero in automatico."""
+        if self._chat_wait():
+            return
+        forge = self._forge(with_client=True)
+        if forge is None:
+            return
+        gia = forge.state.surprise.get("description", "")
+        if gia and not forge.state.surprise.get("done"):
+            testo = gia  # una sorpresa interrotta: si riprende
+        else:
+            testo, ok = QInputDialog.getMultiLineText(
+                self, t("Sorpresa"),
+                t("Cosa deve raccontare il libro? Bastano poche righe: genere, idea, "
+                  "ambientazione, se vuoi la lunghezza. Il resto lo decido io."), "")
+            if not ok or not testo.strip():
+                return
+            if forge.state.transcript or forge.state.outline:
+                scelta = QMessageBox.question(
+                    self, t("Sorpresa"),
+                    t("Questo libro ha già una conversazione o una struttura. La sorpresa "
+                      "continua da lì. Procedo?"))
+                if scelta != QMessageBox.StandardButton.Yes:
+                    return
+        contratto = self._forge_style_contract(forge)
+        righe: list[str] = []
+
+        def nota(n) -> None:
+            if isinstance(n, tuple):
+                self._forge_note_detail(n)
+                return
+            righe.append(str(n))
+            self._forge_show("\n".join(f"- {r}" for r in righe))
+
+        def fatto(resoconto) -> None:
+            self._chat_key = None
+            self._forge_show(resoconto)
+            self._refresh_forge()
+
+        self._forge_job(
+            lambda p, n: forge.surprise(testo, style_contract=contratto, progress=p, note=n,
+                                        should_stop=lambda: self._stop_requested),
+            fatto, "Sorpresa in corso…", progressable=True, stoppable=True, on_note=nota,
+            activity=t("Sto scrivendo il libro da solo…"),
+            steps=t("Passo {0} di {1}…"))
+
+    def _forge_load_manuscript(self) -> None:
+        """«Carica il manoscritto…»: il libro da completare o aggiornare entra nel lavoro."""
+        if self._chat_wait():
+            return
+        forge = self._forge(with_client=True)
+        if forge is None:
+            return
+        percorso, _ = QFileDialog.getOpenFileName(
+            self, t("Il manoscritto"), "",
+            t("Documenti") + " (*.docx *.pdf *.md *.txt *.epub)")
+        if not percorso:
+            return
+        righe: list[str] = []
+
+        def nota(n) -> None:
+            if isinstance(n, tuple):
+                return
+            righe.append(str(n))
+            self._forge_show("\n".join(f"- {r}" for r in righe))
+
+        def fatto(capitoli) -> None:
+            self._chat_key = None
+            self._forge_say("assistant", t(
+                "Manoscritto caricato: {0} capitoli. Il quaderno è già riempito da quello che il "
+                "testo dice, e la voce dell'autore è lo stile del libro. Ora raccontami cosa "
+                "vuoi fare.").format(capitoli))
+            self._refresh_forge()
+
+        self._forge_job(
+            lambda p, n: forge.import_manuscript(Path(percorso), progress=p, note=n,
+                                                 should_stop=lambda: self._stop_requested),
+            fatto, "Leggo il manoscritto…", progressable=True, stoppable=True, on_note=nota,
+            activity=t("Sto leggendo il manoscritto…"), steps=t("Capitolo {0} di {1}…"))
+
+    def _forge_update_document(self) -> None:
+        """«Documento delle modifiche»: il libro aggiornato con ogni modifica segnata."""
+        forge = self._forge()
+        if forge is None:
+            return
+
+        def fatto(file) -> None:
+            self._forge_show(t("Documento delle modifiche scritto:") + "\n\n" + "\n".join(
+                f"- {p}" for p in file))
+            if file:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(file[0].parent)))
+
+        self._forge_job(lambda p, n: forge.update_outputs(), fatto, "Scrivo il documento…",
+                        activity=t("Sto scrivendo il documento delle modifiche…"))
+
+    def _forge_write_trial(self, *, waiver: str = "") -> None:
+        """«Riscrivi in prova»: il capitolo scelto, con la stesura per scene, in output/prove/."""
+        if self._chat_wait():
+            return
+        forge = self._forge(with_client=True)
+        if forge is None:
+            return
+        numero = int(self.fg_trial_chapter.value())
+        if numero not in {int(c.get("number") or 0) for c in forge.state.outline}:
+            QMessageBox.information(self, t("Capitolo inesistente"),
+                                    t("Il capitolo {0} non è nella struttura.").format(numero))
+            return
+        contratto = self._forge_style_contract(forge)
+        righe: list[str] = []
+
+        def nota(n) -> None:
+            if isinstance(n, tuple):
+                self._forge_note_detail(n)
+                return
+            righe.append(str(n))
+            self._forge_show("\n".join(f"- {r}" for r in righe))
+
+        def fatto(risultato) -> None:
+            if risultato.blocked:
+                self._forge_paint(forge)
+                self._forge_plan_blocked(
+                    forge, risultato.number, risultato.title, risultato.blocked,
+                    lambda motivo: self._forge_write_trial(waiver=motivo), trial=True)
+                return
+            if risultato.stopped:
+                self._forge_say("assistant", t(
+                    "Fermato a metà: le scene scritte restano da parte e si riprende da quella "
+                    "che manca."))
+            else:
+                self._forge_say("assistant", t("Prova scritta: {0} → {1}").format(
+                    risultato.line(), risultato.path))
+            self._forge_paint(forge)
+
+        self._forge_job(
+            lambda p, n: forge.write_trial(numero, style_contract=contratto, note=n,
+                                           waiver=waiver,
+                                           should_stop=lambda: self._stop_requested),
+            fatto, "Riscrivo il capitolo in prova…", progressable=True, stoppable=True,
+            on_note=nota, activity=t("Sto riscrivendo il capitolo in prova…"))
+
+    def _forge_rebuild_ledger(self) -> None:
+        """«Ricostruisci il registro»: le schede della continuità dai capitoli scritti."""
+        if self._chat_wait():
+            return
+        forge = self._forge(with_client=True)
+        if forge is None:
+            return
+
+        def fatto(rifatti) -> None:
+            self._forge_say("assistant", t(
+                "Registro della continuità aggiornato ({0} schede ricavate): "
+                "story/ledger.md").format(len(rifatti)))
+
+        self._forge_job(
+            lambda p, n: forge.ledger_rebuild(only_stale=False, progress=p,
+                                              should_stop=lambda: self._stop_requested),
+            fatto, "Ricostruisco il registro…", progressable=True, stoppable=True,
+            activity=t("Sto ricavando il registro dai capitoli…"),
+            steps=t("Scheda {0} di {1}…"))
+
+    def _forge_open_reports(self) -> None:
+        """I capitoli con l'esito della revisione editoriale: quelli da rivedere in testa, e per
+        ciascuno il resoconto e il piano delle scene a un clic."""
+        forge = self._forge()
+        if forge is None:
+            return
+        self._forge_show(self._forge_reports_markdown(forge))
+
+    def _forge_reports_markdown(self, forge) -> str:
+        from bookwriter.forge import editor as ed
+        from bookwriter.forge import scenes as sc
+
+        progetto = forge.project
+        progetto.editorial_dir.mkdir(parents=True, exist_ok=True)
+        segnati = ed.review_flags(progetto)
+        scritti = forge.status().written
+        titoli = {int(c.get("number") or 0): str(c.get("title") or "")
+                  for c in forge.state.outline}
+        righe = [f"## {t('Revisione editoriale dei capitoli')}", ""]
+        if segnati:
+            righe += [t("⚠ {0} capitoli da rivedere: una voce critica della griglia non è "
+                        "superata.").format(len(segnati)), ""]
+        ordine = sorted(scritti, key=lambda n: (n not in segnati, n))
+        for numero in ordine:
+            file, parole, titolo_file = scritti[numero]
+            titolo = titoli.get(numero) or titolo_file or file.stem
+            resoconto = progetto.editorial_dir / f"{file.stem}.md"
+            piano = sc.plan_path(progetto, numero, titolo)
+            if not piano.exists():
+                piano = progetto.plans_dir / f"{file.stem}.json"
+            if numero in segnati:
+                esito = t("⚠ da rivedere: {0}").format(", ".join(segnati[numero]))
+            elif resoconto.exists():
+                esito = t("✓ nessuna voce critica aperta")
+            else:
+                esito = t("senza resoconto (scritto prima della revisione editoriale)")
+            link = []
+            if resoconto.exists():
+                link.append(f"[{t('resoconto')}]({resoconto.as_uri()})")
+            if piano.exists():
+                link.append(f"[{t('piano delle scene')}]({piano.as_uri()})")
+            link.append(f"[{t('capitolo')}]({file.as_uri()})")
+            righe.append(f"- **{numero}. {titolo}** · {parole} {t('parole')} · {esito} · "
+                         + " · ".join(link))
+        if not scritti:
+            righe.append(t("Nessun capitolo scritto."))
+        righe += ["", f"[{t('Apri la cartella dei resoconti')}]"
+                      f"({progetto.editorial_dir.as_uri()})"]
+        return "\n".join(righe)
 
     def _forge_redo_short(self) -> None:
         """«Riscrivi i capitoli troppo corti»: li mette da parte, non li cancella, e li riscrive."""
@@ -5096,6 +6058,781 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     #  tab: consumo dei modelli (token)
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    #  tab: qualità (un capitolo, il libro intero)
+    # ------------------------------------------------------------------ #
+    def _quality_source_row(self, prefisso: str, lay: QVBoxLayout) -> None:
+        """La riga comune alle due sotto-schede: quale libro, e con quale metro (il tipo)."""
+        riga = QHBoxLayout()
+        riga.addWidget(QLabel(t("Libro:")))
+        sorgente = QComboBox()
+        sorgente.setMinimumHeight(44)
+        sorgente.setAccessibleName(t("Libro da valutare"))
+        sorgente.setToolTip(t("Il libro scritto da zero, completato o aggiornato in questo "
+                              "progetto, oppure un file qualsiasi (se ne fa una copia: il file "
+                              "non si tocca mai)."))
+        riga.addWidget(sorgente, 1)
+        riga.addWidget(QLabel(t("Tipo di libro:")))
+        tipo = QComboBox()
+        tipo.setMinimumHeight(44)
+        tipo.setAccessibleName(t("Tipo di libro"))
+        tipo.setToolTip(t("Il metro della valutazione: un manuale, un saggio e un romanzo non si "
+                          "giudicano allo stesso modo. «Dal quaderno» lo ricava dal genere."))
+        riga.addWidget(tipo)
+        lay.addLayout(riga)
+        setattr(self, f"{prefisso}_source", sorgente)
+        setattr(self, f"{prefisso}_kind", tipo)
+        sorgente.activated.connect(lambda _i, pr=prefisso: self._quality_source_chosen(pr))
+        tipo.activated.connect(lambda _i, pr=prefisso: self._quality_kind_chosen(pr))
+
+    def _quality_thresholds_text(self) -> str:
+        slug = self.pm.active_slug()
+        q = self.pm.config_for(slug).quality if slug else None
+        if q is None:
+            return ""
+        return t("Accettato da {0} di media, criteri critici almeno {1}; {2} giri automatici, "
+                 "poi ogni giro lo autorizzi tu (Utilità → Impostazioni).").format(
+                     q.min_global, q.min_critical, q.max_rounds)
+
+    def _tab_quality_chapter(self) -> QWidget:
+        from bookwriter.gui.quality_view import QualityPanel
+
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        intro = QLabel(t(
+            "Voti da 0 a 10 per ogni criterio, con il metro del tipo di libro e del suo scopo. "
+            "«Migliora fino alla qualità» corregge un problema alla volta, solo sulla parte che "
+            "lo riguarda, poi rivaluta; ogni versione resta salvata e si può ripristinare."))
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        self._quality_source_row("qc", lay)
+        riga = QHBoxLayout()
+        riga.addWidget(QLabel(t("Capitolo:")))
+        self.qc_chapter = QComboBox()
+        self.qc_chapter.setMinimumHeight(44)
+        self.qc_chapter.setAccessibleName(t("Capitolo da valutare"))
+        self.qc_chapter.activated.connect(lambda _i: self._quality_show_latest())
+        riga.addWidget(self.qc_chapter, 1)
+        lay.addLayout(riga)
+        comandi = QHBoxLayout()
+        for testo, aiuto, azione in (
+            (t("Valuta il capitolo"), t("Dà i voti, con le prove e i problemi. Non cambia "
+                                        "niente."), self._quality_evaluate_chapter),
+            (t("Migliora fino alla qualità"), t(
+                "Corregge i problemi dei criteri sotto soglia, uno alla volta e solo sulla loro "
+                "parte, e rivaluta, finché la qualità è accettata o fino al tetto dei giri."),
+             self._quality_improve_chapter),
+            (t("Torna alla versione prima"), t(
+                "Rimette nel capitolo la versione precedente (quella attuale resta salvata)."),
+             self._quality_restore),
+            (t("Apri le versioni"), t("La cartella con tutte le versioni del capitolo."),
+             self._quality_open_versions),
+            (t("Apri il report della revisione"), t(
+                "L'ultimo giro di revisione del capitolo: rilievi con ID e stato, piano degli "
+                "interventi, modifiche, gate, verdetto, e le fonti dell'app consultate."),
+             self._quality_open_report),
+        ):
+            b = QPushButton(testo)
+            b.setMinimumHeight(44)
+            b.setToolTip(aiuto)
+            b.clicked.connect(lambda _c=False, a=azione: a())
+            comandi.addWidget(b)
+        comandi.addStretch(1)
+        lay.addLayout(comandi)
+        self.qc_status = QLabel("")
+        self.qc_status.setWordWrap(True)
+        lay.addWidget(self.qc_status)
+        scorre = QScrollArea()
+        scorre.setWidgetResizable(True)
+        scorre.setFrameShape(QFrame.Shape.NoFrame)
+        self.qc_panel = QualityPanel()
+        scorre.setWidget(self.qc_panel)
+        lay.addWidget(scorre, 1)
+        return w
+
+    def _tab_quality_book(self) -> QWidget:
+        from bookwriter.gui.quality_view import QualityPanel
+
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        intro = QLabel(t(
+            "Il libro intero: ogni capitolo con i suoi voti, poi il giudizio del libro (arco, "
+            "coerenza fra i capitoli, ripetizioni, potenziale di pubblico). Dopo l'analisi puoi "
+            "correggere in automatico i capitoli che scegli, ciascuno fino alla qualità "
+            "accettata."))
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        self._quality_source_row("qb", lay)
+        comandi = QHBoxLayout()
+        analizza = QPushButton(t("Analizza il libro"))
+        analizza.setMinimumHeight(44)
+        analizza.setToolTip(t("Valuta ogni capitolo (riusa le valutazioni dei capitoli non "
+                              "cambiati) e il libro intero."))
+        analizza.clicked.connect(self._quality_evaluate_book)
+        comandi.addWidget(analizza)
+        sotto = QPushButton(t("Seleziona quelli sotto soglia"))
+        sotto.setMinimumHeight(44)
+        sotto.clicked.connect(self._quality_select_failing)
+        comandi.addWidget(sotto)
+        correggi = QPushButton(t("Correggi i capitoli selezionati"))
+        correggi.setMinimumHeight(44)
+        correggi.setToolTip(t("Uno dopo l'altro, ciascuno fino alla qualità accettata o al tetto "
+                              "dei giri; oltre il tetto ti chiedo il permesso, giro per giro."))
+        correggi.clicked.connect(lambda: self._quality_improve_selected())
+        comandi.addWidget(correggi)
+        comandi.addStretch(1)
+        lay.addLayout(comandi)
+        self.qb_status = QLabel("")
+        self.qb_status.setWordWrap(True)
+        lay.addWidget(self.qb_status)
+        self.qb_table = QTreeWidget()
+        self.qb_table.setHeaderLabels([t("Capitolo"), t("Globale"), t("Esito"),
+                                       t("Criteri più deboli")])
+        self.qb_table.setRootIsDecorated(False)
+        self.qb_table.setMinimumHeight(160)
+        self.qb_table.setAccessibleName(t("Capitoli del libro con i loro voti"))
+        self.qb_table.itemActivated.connect(self._quality_book_chapter_chosen)
+        lay.addWidget(self.qb_table)
+        scorre = QScrollArea()
+        scorre.setWidgetResizable(True)
+        scorre.setFrameShape(QFrame.Shape.NoFrame)
+        self.qb_panel = QualityPanel()
+        scorre.setWidget(self.qb_panel)
+        lay.addWidget(scorre, 1)
+        return w
+
+    # ---- la struttura del libro: riordinare, tagliare, unire, dividere capitoli ---------
+    def _tab_structure(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        intro = QLabel(t(
+            "La struttura del libro intero: il modello legge le schede dei capitoli (cosa "
+            "fanno, cosa sa il lettore, chi sa cosa, gli eventi) e propone di spostare, tagliare, "
+            "unire o dividere capitoli, ciascuna proposta con il problema che risolve e i legami "
+            "che rompe. Niente si applica senza il tuo sì, una proposta alla volta, e ogni "
+            "applicazione si può annullare."))
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        riga = QHBoxLayout()
+        riga.addWidget(QLabel(t("Libro:")))
+        self.qs_source = QComboBox()
+        self.qs_source.setMinimumHeight(44)
+        self.qs_source.setAccessibleName(t("Libro di cui rivedere la struttura"))
+        self.qs_source.activated.connect(lambda _i: self._refresh_structure())
+        riga.addWidget(self.qs_source, 1)
+        lay.addLayout(riga)
+        comandi = QHBoxLayout()
+        for testo, suggerimento, azione in (
+            (t("Analizza la struttura"), t("Una diagnosi dalle schede dei capitoli: proposte "
+                                           "già passate dai controlli di coerenza."),
+             self._structure_review),
+            (t("Ricontrolla i capitoli segnati"), t(
+                "Dopo un cambiamento: rifà le schede del registro e rivaluta la qualità dei "
+                "capitoli spostati, uniti o divisi."), self._structure_recheck),
+            (t("Annulla l'ultima applicazione"), t(
+                "Riporta i file com'erano prima dell'ultima operazione applicata."),
+             self._structure_undo),
+        ):
+            b = QPushButton(testo)
+            b.setMinimumHeight(44)
+            b.setToolTip(suggerimento)
+            b.clicked.connect(lambda _c=False, a=azione: a())
+            comandi.addWidget(b)
+        comandi.addStretch(1)
+        lay.addLayout(comandi)
+        self.qs_status = QLabel("")
+        self.qs_status.setWordWrap(True)
+        lay.addWidget(self.qs_status)
+        self.qs_table = QTreeWidget()
+        self.qs_table.setHeaderLabels([t("Proposta"), t("Stato"), t("Problema che risolve")])
+        self.qs_table.setRootIsDecorated(False)
+        self.qs_table.setMinimumHeight(160)
+        self.qs_table.setAccessibleName(t("Proposte sulla struttura del libro"))
+        self.qs_table.currentItemChanged.connect(lambda *_: self._structure_show())
+        lay.addWidget(self.qs_table, 1)
+        self.qs_detail = QTextBrowser()
+        self.qs_detail.setMinimumHeight(140)
+        lay.addWidget(self.qs_detail, 1)
+        scelte = QHBoxLayout()
+        for testo, azione in ((t("Accetta…"), lambda: self._structure_decide("accept")),
+                              (t("Rifiuta"), lambda: self._structure_decide("reject")),
+                              (t("Applica"), self._structure_apply),
+                              (t("Integra il contenuto tagliato"), self._structure_integrate)):
+            b = QPushButton(testo)
+            b.setMinimumHeight(44)
+            b.clicked.connect(lambda _c=False, a=azione: a())
+            scelte.addWidget(b)
+        scelte.addStretch(1)
+        lay.addLayout(scelte)
+        return w
+
+    def _structure_forge(self, *, with_client: bool = False):
+        attivo = self._active_silent()
+        chiave = self.qs_source.currentData() if hasattr(self, "qs_source") else None
+        if not attivo or not chiave or chiave == "file" or str(chiave).startswith("ext:"):
+            return None
+        slug, ppaths = attivo
+        cfg = self.pm.config_for(slug)
+        return open_forge(ppaths, cfg, client=self._client(slug) if with_client else None,
+                          mode=chiave)
+
+    def _refresh_structure(self) -> None:
+        if not hasattr(self, "qs_source"):
+            return
+        corrente = self.qs_source.currentData()
+        voci = [(n, k) for n, k in self._quality_sources()
+                if k != "file" and not str(k).startswith("ext:")]
+        self._repopulate(self.qs_source, voci)
+        i = self.qs_source.findData(corrente) if corrente else -1
+        self.qs_source.setCurrentIndex(i if i >= 0 else 0)
+        self.qs_table.clear()
+        self.qs_detail.clear()
+        forge = self._structure_forge()
+        if forge is None:
+            self.qs_status.setText(t("Nessun libro scritto in questo progetto."))
+            return
+        dati = forge.structure_data()
+        self._qs_ops = {}
+        for op in dati.operations():
+            voce = QTreeWidgetItem([op.line(), op.status, op.issue[:160]])
+            if op.blockers:
+                voce.setToolTip(0, "\n".join(op.blockers))
+            voce.setData(0, Qt.ItemDataRole.UserRole, op.id)
+            self._qs_ops[op.id] = op
+            self.qs_table.addTopLevelItem(voce)
+        for col in range(3):
+            self.qs_table.resizeColumnToContents(col)
+        parti = []
+        if dati.recheck:
+            parti.append(t("Capitoli da ricontrollare: {0}").format(
+                ", ".join(str(n) for n in dati.recheck)))
+        if dati.integrations:
+            parti.append(t("Contenuti tagliati da integrare: {0}").format(len(dati.integrations)))
+        if not dati.rounds:
+            parti.append(t("Nessuna analisi ancora: premi «Analizza la struttura»."))
+        self.qs_status.setText(" · ".join(parti))
+
+    def _structure_selected(self):
+        voce = self.qs_table.currentItem()
+        if voce is None:
+            QMessageBox.information(self, t("Struttura del libro"),
+                                    t("Scegli prima una proposta nell'elenco."))
+            return None
+        return self._qs_ops.get(voce.data(0, Qt.ItemDataRole.UserRole))
+
+    def _structure_show(self) -> None:
+        voce = self.qs_table.currentItem()
+        op = self._qs_ops.get(voce.data(0, Qt.ItemDataRole.UserRole)) if voce else None
+        if op is None:
+            self.qs_detail.clear()
+            return
+        righe = [f"## {html.escape(op.line())}", ""]
+        for titolo, valore in ((t("Problema"), op.issue), (t("Evidenza"), op.evidence),
+                               (t("Perché"), op.reason), (t("Rischio"), op.risk)):
+            if valore:
+                righe.append(f"**{titolo}:** {html.escape(valore)}  ")
+        for titolo, elenco in ((t("Legami che rompe"), op.breaks),
+                               (t("Bloccanti (si accetta solo con una deroga)"), op.blockers),
+                               (t("Avvisi"), op.warnings),
+                               (t("Contenuto unico da salvare"), op.unique_content)):
+            if elenco:
+                righe += ["", f"**{titolo}:**"] + [f"- {html.escape(str(x))}" for x in elenco]
+        if op.waiver:
+            righe += ["", f"**{t('Deroga')}:** {html.escape(op.waiver)}"]
+        self.qs_detail.setMarkdown("\n".join(righe))
+
+    def _structure_review(self) -> None:
+        forge = self._structure_forge(with_client=True)
+        if forge is None:
+            return
+        lingua = self._quality_language()
+
+        def nota(n) -> None:
+            if not isinstance(n, tuple):
+                self.qs_status.setText(str(n))
+
+        self._run_bg(lambda p, n: forge.structure_review(
+            explain_language=lingua, progress=p, note=n,
+            should_stop=lambda: self._stop_requested),
+            lambda _giro: self._refresh_structure(), "Analizzo la struttura del libro…",
+            progressable=True, on_note=nota, stoppable=True)
+
+    def _structure_decide(self, decisione: str) -> None:
+        forge = self._structure_forge()
+        op = self._structure_selected()
+        if forge is None or op is None:
+            return
+        deroga, destinazione = "", None
+        if decisione == "accept" and op.blockers:
+            deroga, ok = QInputDialog.getMultiLineText(
+                self, t("Deroga"), t("Questa proposta ha controlli bloccanti:\n{0}\n\nPerché "
+                                     "la accetti lo stesso? Il motivo resta registrato.").format(
+                    "\n".join(f"• {b}" for b in op.blockers)), "")
+            if not ok or not deroga.strip():
+                return
+        if decisione == "accept" and op.kind == "cut" and op.unique_content and \
+                not op.destination:
+            numero, ok = QInputDialog.getInt(
+                self, t("Dove va il contenuto unico?"),
+                t("Il capitolo tagliato ha contenuto che non c'è altrove. In quale capitolo "
+                  "va?"), 1, 1, 999)
+            if not ok:
+                return
+            destinazione = numero
+        try:
+            forge.structure_decide(op.id, decisione, waiver=deroga.strip(),
+                                   destination=destinazione)
+        except ValueError as exc:
+            QMessageBox.warning(self, t("Struttura del libro"), str(exc))
+        self._refresh_structure()
+
+    def _structure_apply(self) -> None:
+        forge = self._structure_forge(with_client=True)
+        op = self._structure_selected()
+        if forge is None or op is None:
+            return
+        if op.status != "accettata":
+            QMessageBox.information(self, t("Struttura del libro"),
+                                    t("Si applica solo una proposta accettata."))
+            return
+
+        def fatto(esito) -> None:
+            run = esito.run
+            righe = [t("Applicato: {0}").format(op.line())]
+            if run.renamed:
+                righe.append(t("File rinominati: {0}").format(len(run.renamed)))
+            righe += [f"• {a}" for a in run.warnings]
+            if run.recheck:
+                righe.append(t("Da ricontrollare: capitoli {0}").format(
+                    ", ".join(str(n) for n in run.recheck)))
+            QMessageBox.information(self, t("Struttura del libro"), "\n".join(righe))
+            self._refresh_structure()
+
+        self._run_bg(lambda: forge.structure_apply(op.id), fatto,
+                     "Applico la modifica alla struttura…",
+                     on_error=lambda m: (QMessageBox.warning(self, t("Struttura del libro"), m),
+                                         self._refresh_structure()))
+
+    def _structure_undo(self) -> None:
+        forge = self._structure_forge()
+        if forge is None:
+            return
+        try:
+            forge.structure_undo()
+        except ValueError as exc:
+            risposta = QMessageBox.question(
+                self, t("Struttura del libro"),
+                str(exc) + "\n\n" + t("Annullare lo stesso? Le modifiche fatte dopo ai file "
+                                        "coinvolti andrebbero perse."))
+            if risposta != QMessageBox.StandardButton.Yes:
+                return
+            forge.structure_undo(force=True)
+        self._refresh_structure()
+        self.qs_status.setText(t("Ultima applicazione annullata: i file sono tornati com'erano."))
+
+    def _structure_integrate(self) -> None:
+        forge = self._structure_forge(with_client=True)
+        op = self._structure_selected()
+        if forge is None or op is None:
+            return
+        if not any(i.get("op") == op.id for i in forge.structure_data().integrations):
+            QMessageBox.information(self, t("Struttura del libro"), t(
+                "Questa proposta non ha contenuto tagliato da integrare."))
+            return
+        self._run_bg(lambda p, n: forge.structure_integrate(
+            op.id, style_contract=self._forge_style_contract(forge), note=n,
+            should_stop=lambda: self._stop_requested),
+            lambda _r: self._refresh_structure(), "Integro il contenuto tagliato…",
+            progressable=True, on_note=lambda n: self.qs_status.setText(str(n)),
+            stoppable=True)
+
+    def _structure_recheck(self) -> None:
+        forge = self._structure_forge(with_client=True)
+        if forge is None:
+            return
+        lingua = self._quality_language()
+        self._run_bg(lambda p, n: forge.structure_recheck(
+            explain_language=lingua, progress=p, note=n,
+            should_stop=lambda: self._stop_requested),
+            lambda fatti: (self._refresh_structure(), self.qs_status.setText(
+                t("Ricontrollati i capitoli: {0}").format(", ".join(str(x) for x in fatti))
+                if fatti else t("Niente da ricontrollare."))),
+            "Ricontrollo i capitoli…", progressable=True,
+            on_note=lambda n: self.qs_status.setText(str(n)), stoppable=True)
+
+    # ---- dati ---------------------------------------------------------------------
+    def _quality_sources(self) -> list[tuple[str, str]]:
+        attivo = self._active_silent()
+        if not attivo:
+            return []
+        _slug, ppaths = attivo
+        from bookwriter.forge.project import BookProject
+
+        voci = []
+        for chiave, nome in (("nuovo", t("Il libro scritto da zero")),
+                             ("completa", t("Il libro completato")),
+                             ("aggiorna", t("Il libro aggiornato"))):
+            radice = ppaths.book if chiave == "nuovo" else ppaths.root / chiave
+            if BookProject(radice).written_chapters():
+                voci.append((nome, chiave))
+        esterni = ppaths.root / "valutazioni"
+        if esterni.exists():
+            for cartella in sorted(p for p in esterni.iterdir() if p.is_dir()):
+                if BookProject(cartella).written_chapters():
+                    voci.append((t("File: {0}").format(cartella.name), f"ext:{cartella}"))
+        voci.append((t("Un altro file…"), "file"))
+        return voci
+
+    def _quality_forge(self, prefisso: str, *, with_client: bool = False):
+        attivo = self._active_silent()
+        chiave = getattr(self, f"{prefisso}_source").currentData()
+        if not attivo or not chiave or chiave == "file":
+            return None
+        slug, ppaths = attivo
+        cfg = self.pm.config_for(slug)
+        cliente = self._client(slug) if with_client else None
+        if str(chiave).startswith("ext:"):
+            from bookwriter.forge.engine import Forge
+
+            return Forge(Path(chiave[4:]), cfg, client=cliente, db_path=ppaths.db,
+                         vectors_path=ppaths.vectors)
+        return open_forge(ppaths, cfg, client=cliente, mode=chiave)
+
+    def _quality_fill(self, prefisso: str, scelta: str | None = None) -> None:
+        sorgente = getattr(self, f"{prefisso}_source")
+        corrente = scelta or sorgente.currentData()
+        self._repopulate(sorgente, self._quality_sources())
+        i = sorgente.findData(corrente) if corrente else -1
+        sorgente.setCurrentIndex(i if i >= 0 else 0)
+        self._quality_fill_kind(prefisso)
+
+    def _quality_fill_kind(self, prefisso: str) -> None:
+        tipo = getattr(self, f"{prefisso}_kind")
+        forge = self._quality_forge(prefisso)
+        tipo.clear()
+        if forge is None:
+            return
+        dal_quaderno = ql.kind_of(nb.get(forge.state, "form"), nb.is_narrative(forge.state))
+        tipo.addItem(t("dal quaderno: {0}").format(t(ql.KINDS[dal_quaderno])), "")
+        for chiave, nome in ql.KINDS.items():
+            tipo.addItem(t(nome), chiave)
+        scelto = str(forge.state.quality.get("kind") or "")
+        tipo.setCurrentIndex(max(0, tipo.findData(scelto)))
+
+    def _quality_source_chosen(self, prefisso: str) -> None:
+        sorgente = getattr(self, f"{prefisso}_source")
+        if sorgente.currentData() == "file":
+            self._quality_open_file(prefisso)
+            return
+        self._quality_fill_kind(prefisso)
+        if prefisso == "qc":
+            self._refresh_quality_chapter()
+        else:
+            self._refresh_quality_book()
+
+    def _quality_kind_chosen(self, prefisso: str) -> None:
+        forge = self._quality_forge(prefisso)
+        if forge is None:
+            return
+        forge.set_quality_kind(getattr(self, f"{prefisso}_kind").currentData() or "")
+
+    def _quality_open_file(self, prefisso: str) -> None:
+        attivo = self._active()
+        if not attivo:
+            return
+        slug, ppaths = attivo
+        nome, _ = QFileDialog.getOpenFileName(
+            self, t("Il libro da valutare"), str(Path.home()),
+            t("Testi (*.md *.txt *.docx *.odt *.pdf *.epub *.html);;Tutti i file (*)"))
+        if not nome:
+            self._quality_fill(prefisso)
+            return
+        from bookwriter.forge.engine import open_quality_workspace
+
+        try:
+            forge = open_quality_workspace(ppaths, self.pm.config_for(slug), Path(nome))
+        except Exception as exc:  # noqa: BLE001 - un file illeggibile si dice
+            QMessageBox.warning(self, t("Il file non si legge"), str(exc))
+            self._quality_fill(prefisso)
+            return
+        self._quality_fill(prefisso, f"ext:{forge.project.root}")
+        if prefisso == "qc":
+            self._refresh_quality_chapter()
+        else:
+            self._refresh_quality_book()
+
+    # ---- un capitolo -----------------------------------------------------------------
+    def _refresh_quality_chapter(self) -> None:
+        if not hasattr(self, "qc_source"):
+            return
+        if self.qc_source.count() == 0 or self.qc_source.currentData() == "file":
+            self._quality_fill("qc")
+        forge = self._quality_forge("qc")
+        scelto = self.qc_chapter.currentData()
+        voci = []
+        if forge is not None:
+            titoli = {int(c.get("number") or 0): str(c.get("title") or "")
+                      for c in forge.state.outline}
+            for n, f in sorted(forge.project.written_chapters().items()):
+                voci.append((f"{n}. {titoli.get(n) or f.stem}", n))
+        self._repopulate(self.qc_chapter, voci)
+        i = self.qc_chapter.findData(scelto) if scelto is not None else -1
+        if i >= 0:
+            self.qc_chapter.setCurrentIndex(i)
+        self.qc_status.setText(self._quality_thresholds_text() if voci else
+                               t("Nessun capitolo scritto in questo libro."))
+        self._quality_show_latest()
+
+    def _quality_chapter_file(self, forge, numero: int):
+        return forge.project.written_chapters().get(int(numero))
+
+    def _quality_show_latest(self) -> None:
+        forge = self._quality_forge("qc")
+        numero = self.qc_chapter.currentData()
+        if forge is None or numero is None:
+            self.qc_panel.clear()
+            return
+        file = self._quality_chapter_file(forge, numero)
+        ultima = ql.latest(forge.project, file.stem) if file else None
+        if ultima is None:
+            self.qc_panel.clear(t("Il capitolo non è ancora stato valutato."))
+            return
+        self.qc_panel.show_evaluation(ultima, forge.quality_thresholds())
+        if file and ultima.text_hash != ql._hash(file.read_text(encoding="utf-8")):
+            self.qc_status.setText(t("Il capitolo è cambiato dopo quest'ultima valutazione: "
+                                     "valutalo di nuovo."))
+
+    def _quality_language(self) -> str:
+        from bookwriter.config import language_label
+        from bookwriter.gui.i18n import current_language
+
+        return language_label(current_language()) or "italiano"
+
+    def _quality_evaluate_chapter(self) -> None:
+        forge = self._quality_forge("qc", with_client=True)
+        numero = self.qc_chapter.currentData()
+        if forge is None or numero is None:
+            return
+        lingua = self._quality_language()
+
+        def fatto(valutazione) -> None:
+            self.qc_panel.show_evaluation(valutazione, forge.quality_thresholds())
+            self.qc_status.setText(t("Valutato: globale {0}.").format(valutazione.global_score))
+
+        self._run_bg(lambda p: forge.evaluate_chapter_quality(int(numero), explain_language=lingua,
+                                                              progress=p),
+                     fatto, "Valuto la qualità del capitolo…", progressable=True)
+
+    def _quality_style(self, forge) -> str:
+        style_id = int(getattr(forge.state, "style_id", 0) or 0)
+        if not style_id:
+            return ""
+        attivo = self._active_silent()
+        if not attivo:
+            return ""
+        row = project_schema.get_style_row(attivo[1].db, style_id)
+        return build_style_contract(StyleProfile.model_validate(row["data"])) if row else ""
+
+    def _quality_improve_chapter(self, *, rounds: int | None = None, then=None,
+                                 prefisso: str = "qc", numero: int | None = None) -> None:
+        forge = self._quality_forge(prefisso, with_client=True)
+        numero = self.qc_chapter.currentData() if numero is None else numero
+        if forge is None or numero is None:
+            return
+        lingua = self._quality_language()
+        stile = self._quality_style(forge)
+        stato = self.qc_status if prefisso == "qc" else self.qb_status
+
+        def nota(n) -> None:
+            if isinstance(n, tuple) and n and n[0] == "fix":
+                stato.setText(t("Correggo il problema {0} di {1}…").format(n[1], n[2]))
+            elif not isinstance(n, tuple):
+                stato.setText(str(n))
+
+        def fatto(resoconto) -> None:
+            if resoconto.final is not None and prefisso == "qc":
+                self.qc_panel.show_evaluation(resoconto.final, forge.quality_thresholds())
+            stato.setText(resoconto.line() + ("\n" + "\n".join(resoconto.rounds)
+                                              if resoconto.rounds else ""))
+            if resoconto.needs_authorization and not self._stop_requested:
+                scelta = QMessageBox.question(
+                    self, t("Un altro giro?"),
+                    t("Il capitolo {0} è a {1} dopo i giri automatici e non ha ancora la qualità "
+                      "accettata, ma l'ultimo giro l'ha migliorato. Faccio un altro giro?").format(
+                        resoconto.chapter, resoconto.after))
+                if scelta == QMessageBox.StandardButton.Yes:
+                    QTimer.singleShot(0, lambda: self._quality_improve_chapter(
+                        rounds=1, then=then, prefisso=prefisso, numero=numero))
+                    return
+            if then:
+                then(resoconto)
+
+        self._run_bg(
+            lambda p, n: forge.improve_chapter_quality(
+                int(numero), rounds=rounds, explain_language=lingua, style_contract=stile,
+                note=n, should_stop=lambda: self._stop_requested),
+            fatto, "Miglioro il capitolo fino alla qualità…", progressable=True,
+            on_note=nota, stoppable=True)
+
+    def _quality_restore(self) -> None:
+        forge = self._quality_forge("qc")
+        numero = self.qc_chapter.currentData()
+        if forge is None or numero is None:
+            return
+        file = self._quality_chapter_file(forge, numero)
+        versioni = ql.versions(forge.project, file.stem) if file else []
+        attuale = file.read_text(encoding="utf-8") if file else ""
+        precedenti = [v for v in versioni if v.read_text(encoding="utf-8") != attuale]
+        if not precedenti:
+            QMessageBox.information(self, t("Nessuna versione"),
+                                    t("Di questo capitolo non c'è una versione precedente."))
+            return
+        ultima = precedenti[-1]
+        scelta = QMessageBox.question(
+            self, t("Tornare alla versione prima?"),
+            t("Rimetto nel capitolo la versione «{0}». Quella attuale resta salvata fra le "
+              "versioni.").format(ultima.stem))
+        if scelta != QMessageBox.StandardButton.Yes:
+            return
+        ql.restore(forge.project, file, ultima)
+        self.qc_status.setText(t("Ripristinata la versione «{0}».").format(ultima.stem))
+        self._quality_show_latest()
+
+    def _quality_open_report(self) -> None:
+        from bookwriter.forge import revision as rv
+
+        forge = self._quality_forge("qc")
+        numero = self.qc_chapter.currentData()
+        if forge is None or numero is None:
+            return
+        esecuzione = rv.latest_run(forge.project, int(numero))
+        if esecuzione is None:
+            QMessageBox.information(self, t("Nessuna revisione"),
+                                    t("Questo capitolo non ha ancora un giro di revisione."))
+            return
+        report = rv.run_dir(forge.project, esecuzione.run_id) / "report.md"
+        self.qc_status.setText(t("Ultima revisione: {0} — verdetto {1}.").format(
+            esecuzione.run_id, esecuzione.verdict))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(report)))
+
+    def _quality_open_versions(self) -> None:
+        forge = self._quality_forge("qc")
+        numero = self.qc_chapter.currentData()
+        if forge is None or numero is None:
+            return
+        file = self._quality_chapter_file(forge, numero)
+        cartella = ql.versions_dir(forge.project, file.stem)
+        cartella.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(cartella)))
+
+    # ---- il libro intero ---------------------------------------------------------------
+    def _refresh_quality_book(self) -> None:
+        if not hasattr(self, "qb_source"):
+            return
+        if self.qb_source.count() == 0 or self.qb_source.currentData() == "file":
+            self._quality_fill("qb")
+        forge = self._quality_forge("qb")
+        self.qb_table.clear()
+        if forge is None:
+            self.qb_panel.clear()
+            return
+        libro, capitoli = ql.load_book(forge.project)
+        soglie = forge.quality_thresholds()
+        self._quality_book_rows(capitoli, soglie)
+        if libro is not None:
+            self.qb_panel.show_evaluation(libro, soglie)
+            self.qb_status.setText(self._quality_thresholds_text())
+        else:
+            self.qb_panel.clear(t("Il libro non è ancora stato analizzato."))
+            self.qb_status.setText(self._quality_thresholds_text())
+        self._qb_chapters = {c.chapter: c for c in capitoli}
+
+    def _quality_book_rows(self, capitoli, soglie) -> None:
+        self.qb_table.clear()
+        for c in capitoli:
+            deboli = sorted((s for s in c.scores if s.applicable and s.key != "potenziale"),
+                            key=lambda s: s.score)[:3]
+            voce = QTreeWidgetItem([
+                f"{c.chapter}. {c.title}", "—" if c.global_score is None else f"{c.global_score}",
+                t("accettato") if c.accepted(soglie) else t("da migliorare"),
+                ", ".join(f"{t(s.label)} {s.score}" for s in deboli)])
+            voce.setData(0, Qt.ItemDataRole.UserRole, c.chapter)
+            voce.setFlags(voce.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            voce.setCheckState(0, Qt.CheckState.Unchecked)
+            self.qb_table.addTopLevelItem(voce)
+        for col in range(4):
+            self.qb_table.resizeColumnToContents(col)
+
+    def _quality_book_chapter_chosen(self, voce, _col) -> None:
+        numero = voce.data(0, Qt.ItemDataRole.UserRole)
+        forge = self._quality_forge("qb")
+        valutazione = getattr(self, "_qb_chapters", {}).get(numero)
+        if forge is not None and valutazione is not None:
+            self.qb_panel.show_evaluation(valutazione, forge.quality_thresholds())
+
+    def _quality_select_failing(self) -> None:
+        forge = self._quality_forge("qb")
+        if forge is None:
+            return
+        soglie = forge.quality_thresholds()
+        for i in range(self.qb_table.topLevelItemCount()):
+            voce = self.qb_table.topLevelItem(i)
+            c = getattr(self, "_qb_chapters", {}).get(voce.data(0, Qt.ItemDataRole.UserRole))
+            voce.setCheckState(0, Qt.CheckState.Checked if c is not None
+                               and not c.accepted(soglie) else Qt.CheckState.Unchecked)
+
+    def _quality_evaluate_book(self) -> None:
+        forge = self._quality_forge("qb", with_client=True)
+        if forge is None:
+            return
+        lingua = self._quality_language()
+
+        def fatto(risultato) -> None:
+            libro, capitoli = risultato
+            soglie = forge.quality_thresholds()
+            self._qb_chapters = {c.chapter: c for c in capitoli}
+            self._quality_book_rows(capitoli, soglie)
+            self.qb_panel.show_evaluation(libro, soglie)
+            sotto = sum(1 for c in capitoli if not c.accepted(soglie))
+            self.qb_status.setText(t("Analizzato: globale {0}; {1} capitoli su {2} da "
+                                     "migliorare.").format(libro.global_score, sotto,
+                                                           len(capitoli)))
+
+        def nota(n) -> None:
+            if not isinstance(n, tuple):
+                self.qb_status.setText(str(n))
+
+        self._run_bg(lambda p, n: forge.evaluate_book_quality(
+            explain_language=lingua, progress=p, note=n,
+            should_stop=lambda: self._stop_requested),
+            fatto, "Valuto la qualità del libro…", progressable=True, on_note=nota,
+            stoppable=True)
+
+    def _quality_improve_selected(self) -> None:
+        scelti = [self.qb_table.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole)
+                  for i in range(self.qb_table.topLevelItemCount())
+                  if self.qb_table.topLevelItem(i).checkState(0) == Qt.CheckState.Checked]
+        if not scelti:
+            QMessageBox.information(self, t("Nessun capitolo scelto"),
+                                    t("Spunta i capitoli da correggere (o «Seleziona quelli "
+                                      "sotto soglia»)."))
+            return
+        resoconti: list[str] = []
+
+        def prossimo(resoconto=None) -> None:
+            if resoconto is not None:
+                resoconti.append(resoconto.line())
+                self.qb_status.setText("\n".join(resoconti))
+            if not scelti or self._stop_requested:
+                if resoconti:
+                    self.qb_status.setText("\n".join(resoconti) + "\n" + t(
+                        "Finito. «Analizza il libro» aggiorna il giudizio del libro intero."))
+                return
+            numero = scelti.pop(0)
+            self._quality_improve_chapter(prefisso="qb", numero=int(numero), then=prossimo)
+
+        prossimo()
+
     def _tab_usage(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -5292,6 +7029,16 @@ class MainWindow(QMainWindow):
             "migliaia di token di ragionamento). «Come l'altro livello» non cambia niente."))
         self.set_effort_quick.setAccessibleName(t("Ragionamento dei compiti rapidi"))
         form.addRow(t("Ragionamento (compiti rapidi):"), self.set_effort_quick)
+        self.set_effort_writing = QComboBox()
+        self.set_effort_writing.addItem(t("Come l'altro livello"), "same")
+        for valore, etichetta in reasoning_choices():
+            self.set_effort_writing.addItem(etichetta, valore)
+        self.set_effort_writing.setToolTip(t(
+            "Quanto ragiona il modello mentre scrive il libro: piano delle scene, stesura, "
+            "revisione editoriale, registro della continuità. Si può tenere basso il livello "
+            "generale per la ricerca e alto questo. «Come l'altro livello» non cambia niente."))
+        self.set_effort_writing.setAccessibleName(t("Ragionamento della stesura"))
+        form.addRow(t("Ragionamento (stesura):"), self.set_effort_writing)
         self.set_structured = QComboBox()
         for valore, etichetta in structured_choices():
             self.set_structured.addItem(etichetta, valore)
@@ -5410,6 +7157,42 @@ class MainWindow(QMainWindow):
         jev_soglie.addWidget(self.set_jev_chars)
         jev_soglie.addStretch(1)
         lay.addLayout(jev_soglie)
+        # Il servizio dei giudizi rapidi: Jev, o un servizio compatibile (anche locale).
+        jev_servizio = QHBoxLayout()
+        jev_servizio.addWidget(QLabel(t("Indirizzo del servizio:")))
+        self.set_jev_url = QLineEdit()
+        self.set_jev_url.setMinimumHeight(44)
+        self.set_jev_url.setPlaceholderText(JEV_DEFAULT_URL)
+        self.set_jev_url.setToolTip(t(
+            "L'indirizzo del servizio dei giudizi rapidi. Si può usare un servizio compatibile "
+            "con la stessa API, anche sul tuo computer: con un indirizzo locale la chiave non "
+            "serve."))
+        self.set_jev_url.setAccessibleName(t("Indirizzo del servizio dei giudizi rapidi"))
+        jev_servizio.addWidget(self.set_jev_url, 1)
+        jev_servizio.addWidget(QLabel(t("Modello:")))
+        self.set_jev_model = QLineEdit()
+        self.set_jev_model.setMinimumHeight(44)
+        self.set_jev_model.setPlaceholderText(JEV_DEFAULT_MODEL)
+        self.set_jev_model.setAccessibleName(t("Modello dei giudizi rapidi"))
+        jev_servizio.addWidget(self.set_jev_model)
+        lay.addLayout(jev_servizio)
+        jev_tempi = QHBoxLayout()
+        jev_tempi.addWidget(QLabel(t("Richieste insieme:")))
+        self.set_jev_parallel = QSpinBox()
+        self.set_jev_parallel.setRange(1, 16)
+        self.set_jev_parallel.setMinimumHeight(44)
+        self.set_jev_parallel.setToolTip(t(
+            "Quante sezioni di una pagina lunga si fanno giudicare insieme."))
+        self.set_jev_parallel.setAccessibleName(t("Richieste insieme ai giudizi rapidi"))
+        jev_tempi.addWidget(self.set_jev_parallel)
+        jev_tempi.addWidget(QLabel(t("Tempo massimo per richiesta (s):")))
+        self.set_jev_timeout = QSpinBox()
+        self.set_jev_timeout.setRange(1, 600)
+        self.set_jev_timeout.setMinimumHeight(44)
+        self.set_jev_timeout.setAccessibleName(t("Tempo massimo per richiesta ai giudizi rapidi"))
+        jev_tempi.addWidget(self.set_jev_timeout)
+        jev_tempi.addStretch(1)
+        lay.addLayout(jev_tempi)
         esclusi = QHBoxLayout()
         esclusi.addWidget(QLabel(t("Domini esclusi:")))
         self.set_excluded = QLineEdit()
@@ -5441,6 +7224,38 @@ class MainWindow(QMainWindow):
         fetcher_lay.addWidget(self.set_external_timeout)
         lay.addLayout(fetcher_lay)
 
+        # La verifica della qualità: quando un capitolo è accettato, e quanti giri automatici.
+        qualita = QHBoxLayout()
+        qualita.addWidget(QLabel(t("Qualità accettata da (0-10):")))
+        self.set_q_global = QDoubleSpinBox()
+        self.set_q_global.setRange(0.0, 10.0)
+        self.set_q_global.setSingleStep(0.5)
+        self.set_q_global.setDecimals(1)
+        self.set_q_global.setMinimumHeight(44)
+        self.set_q_global.setToolTip(t("Il voto globale da cui un capitolo è accettato."))
+        self.set_q_global.setAccessibleName(t("Voto globale minimo"))
+        qualita.addWidget(self.set_q_global)
+        qualita.addWidget(QLabel(t("Criteri critici almeno:")))
+        self.set_q_critical = QDoubleSpinBox()
+        self.set_q_critical.setRange(0.0, 10.0)
+        self.set_q_critical.setSingleStep(0.5)
+        self.set_q_critical.setDecimals(1)
+        self.set_q_critical.setMinimumHeight(44)
+        self.set_q_critical.setToolTip(t(
+            "Ogni criterio critico per il tipo di libro deve arrivare almeno qui."))
+        self.set_q_critical.setAccessibleName(t("Voto minimo dei criteri critici"))
+        qualita.addWidget(self.set_q_critical)
+        qualita.addWidget(QLabel(t("Giri automatici:")))
+        self.set_q_rounds = QSpinBox()
+        self.set_q_rounds.setRange(0, 20)
+        self.set_q_rounds.setMinimumHeight(44)
+        self.set_q_rounds.setToolTip(t(
+            "Quanti giri di correzione si fanno da soli. Oltre, ogni giro lo autorizzi tu."))
+        self.set_q_rounds.setAccessibleName(t("Giri automatici di correzione"))
+        qualita.addWidget(self.set_q_rounds)
+        qualita.addStretch(1)
+        lay.addLayout(qualita)
+
         row = QHBoxLayout()
         save = QPushButton(t("Salva le impostazioni"))
         save.setToolTip(t("Applica la scelta al progetto attivo (le operazioni successive useranno questi modelli)."))
@@ -5467,6 +7282,8 @@ class MainWindow(QMainWindow):
         self.set_effort.setCurrentIndex(max(self.set_effort.findData(cfg.llm.reasoning_effort), 0))
         self.set_effort_quick.setCurrentIndex(max(self.set_effort_quick.findData(
             cfg.llm.reasoning_effort_quick), 0))
+        self.set_effort_writing.setCurrentIndex(max(self.set_effort_writing.findData(
+            cfg.llm.reasoning_effort_writing), 0))
         self.set_structured.setCurrentIndex(max(self.set_structured.findData(
             cfg.llm.structured_mode()), 0))
         for chiave, campo in self.set_sampling.items():
@@ -5483,6 +7300,13 @@ class MainWindow(QMainWindow):
         self.set_jev_key.setText(cfg.research.jev_api_key)
         self.set_jev_min.setValue(cfg.research.jev_min_score)
         self.set_jev_chars.setValue(cfg.research.jev_max_chars)
+        self.set_jev_url.setText(cfg.research.jev_url)
+        self.set_jev_model.setText(cfg.research.jev_model)
+        self.set_jev_parallel.setValue(cfg.research.jev_parallel)
+        self.set_jev_timeout.setValue(int(cfg.research.jev_timeout_s))
+        self.set_q_global.setValue(cfg.quality.min_global)
+        self.set_q_critical.setValue(cfg.quality.min_critical)
+        self.set_q_rounds.setValue(cfg.quality.max_rounds)
         self.set_excluded.setText(", ".join(cfg.research.excluded_domains))
         self.set_external_fetcher.setText(cfg.research.external_fetcher_url)
         self.set_external_timeout.setValue(int(cfg.research.external_fetcher_timeout_s))
@@ -5885,6 +7709,8 @@ class MainWindow(QMainWindow):
                 "reasoning_effort": self.set_effort.currentData() or "",
                 "reasoning_effort_quick": ("same" if self.set_effort_quick.currentData() is None
                                            else self.set_effort_quick.currentData()),
+                "reasoning_effort_writing": ("same" if self.set_effort_writing.currentData() is None
+                                             else self.set_effort_writing.currentData()),
                 "structured_output": self.set_structured.currentData() or "json_schema",
                 **campionamento,
             }),
@@ -5899,11 +7725,20 @@ class MainWindow(QMainWindow):
                 "jev_api_key": self.set_jev_key.text().strip(),
                 "jev_min_score": self.set_jev_min.value(),
                 "jev_max_chars": self.set_jev_chars.value(),
+                "jev_url": self.set_jev_url.text().strip() or JEV_DEFAULT_URL,
+                "jev_model": self.set_jev_model.text().strip() or JEV_DEFAULT_MODEL,
+                "jev_parallel": self.set_jev_parallel.value(),
+                "jev_timeout_s": float(self.set_jev_timeout.value()),
                 "excluded_domains": [d.strip() for d in
                                      self.set_excluded.text().replace(";", ",").split(",")
                                      if d.strip()],
                 "external_fetcher_url": self.set_external_fetcher.text().strip(),
                 "external_fetcher_timeout_s": float(self.set_external_timeout.value()),
+            }),
+            "quality": cfg.quality.model_copy(update={
+                "min_global": self.set_q_global.value(),
+                "min_critical": self.set_q_critical.value(),
+                "max_rounds": self.set_q_rounds.value(),
             }),
         })
 

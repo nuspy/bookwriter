@@ -63,6 +63,18 @@ class LanceStore:
         else:
             self._db.create_table(name, data=records)
 
+    def delete(self, kind: str, ids: list[int]) -> None:
+        """Toglie le righe indicate: un'idea fusa non deve più comparire fra i vicini.
+
+        Serve anche per l'idea che ha assorbito l'altra: il suo testo è cambiato, il vettore
+        vecchio va rifatto e l'embedding incrementale lo rifà solo se manca.
+        """
+        clean = sorted({int(i) for i in ids})
+        if not clean or not self._has(kind):
+            return
+        table = self._db.open_table(self._table_name(kind))
+        table.delete(f"id IN ({', '.join(str(i) for i in clean)})")
+
     def all_vectors(self, kind: str) -> list[tuple[int, list[float]]]:
         """Tutte le coppie ``(id, vector)`` della tabella (per costruire il grafo top-k)."""
         if not self._has(kind):

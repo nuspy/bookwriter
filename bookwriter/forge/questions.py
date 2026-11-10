@@ -34,6 +34,8 @@ from bookwriter.config import ResearchSettings, language_label
 from bookwriter.forge import research_store as store
 from bookwriter.forge.project import ForgeState
 from bookwriter.forge.websearch import fetch
+from bookwriter.ingest.audio import AUDIO_EXTENSIONS
+from bookwriter.ingest.loaders import SUPPORTED_EXTENSIONS
 
 _URL = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 
@@ -41,7 +43,10 @@ _URL = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 HISTORY_CHARS = 40_000
 
 #: Le estensioni che si sanno leggere (quelle dei loader già usati per i documenti del progetto).
-DOCUMENT_SUFFIXES = (".pdf", ".docx", ".md", ".markdown", ".txt", ".text")
+#: Gli allegati della chat si leggono come l'importazione: documenti, scansioni, posta, pagine
+#: web salvate, fogli di calcolo. L'audio no: trascriverlo in mezzo a una conversazione la
+#: fermerebbe per minuti.
+DOCUMENT_SUFFIXES = tuple(sorted(e for e in SUPPORTED_EXTENSIONS if e not in AUDIO_EXTENSIONS))
 
 
 @dataclass
@@ -86,7 +91,7 @@ def read_material(settings: ResearchSettings, text: str, files: list[Path]) -> M
         percorso = Path(percorso)
         if percorso.suffix.lower() not in DOCUMENT_SUFFIXES:
             materiale.notes.append(f"{percorso.name}: formato non supportato "
-                                   "(pdf, docx, md, txt).")
+                                   f"({', '.join(e.lstrip('.') for e in DOCUMENT_SUFFIXES)}).")
             continue
         try:
             doc = load_document(percorso)

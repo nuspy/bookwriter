@@ -2,7 +2,8 @@
 
 Per ogni nodo si cercano i ``k`` vicini semantici nello store vettoriale e si creano archi
 ``thematic`` con peso = similarità coseno. Idempotente: ricostruisce gli archi con ``source=vector``.
-La classificazione fine del tipo di arco via LLM è una possibile evoluzione (vedi PLAN §4.4).
+Il tipo logico dei legami (causa, sequenza, contraddizione, esempio) lo dà il modello in
+:mod:`bookwriter.memory.links`, su questi stessi vicini; quegli archi qui non si toccano.
 """
 
 from __future__ import annotations

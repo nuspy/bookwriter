@@ -45,6 +45,12 @@ class QueuedBook:
     style_profile_id: int | None = None
     ratio: float | None = None
     critic: bool = True
+    #: le opzioni della traduzione letteraria e della forma (vedi ``rewrite_document``); in coda
+    #: nessuno risponde alle domande sui modi di dire: restano «non decise», da decidere dopo
+    literary: bool | None = None
+    polish: bool | None = None
+    form: str = "keep"
+    modernize: bool = False
     state: str = ATTESA
     detail: str = ""
 
@@ -108,6 +114,8 @@ def load_queue(db_path: Path) -> list[QueuedBook]:
             mode=r.mode, contract=r.contract, target_language=r.target_language,
             style_name=r.style_name, style_profile_id=r.style_profile_id,
             ratio=r.ratio, critic=bool(r.critic),
+            literary=r.literary, polish=r.polish, form=r.form or "keep",
+            modernize=bool(r.modernize),
             state=r.state, detail=r.detail,
         )
         for r in righe
@@ -132,6 +140,8 @@ def save_queue(db_path: Path, books: list[QueuedBook]) -> None:
                 contract=libro.contract, target_language=libro.target_language,
                 style_name=libro.style_name, style_profile_id=libro.style_profile_id,
                 ratio=libro.ratio, critic=libro.critic,
+                literary=libro.literary, polish=libro.polish, form=libro.form,
+                modernize=libro.modernize,
                 state=libro.state, detail=libro.detail,
             ))
         ses.commit()
@@ -240,6 +250,10 @@ def run_queue(
                 critic_model=critic_model,
                 progress=avanza,
                 should_stop=should_abort,
+                literary=libro.literary,
+                polish=libro.polish,
+                form=libro.form,
+                modernize=libro.modernize,
             )
             if rapporto.stopped:
                 # Interrotto a metà: il file non si scrive, perché un libro monco che si presenta

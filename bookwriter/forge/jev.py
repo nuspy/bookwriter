@@ -13,6 +13,11 @@ una pagina intera né un PDF) e il punto del capitolo che si sta cercando. Mai l
 libro. Spento per impostazione: senza chiave o con ``jev_enabled`` falso non si manda niente a
 nessuno. Se Jev non risponde, chi chiama ripiega sul modello locale (comportamento di sempre).
 
+Indirizzo, modello e richieste in parallelo stanno nelle impostazioni (``jev_url``,
+``jev_model``, ``jev_parallel``): un servizio che parla la stessa API, anche sul computer
+dell'autore, prende il posto di Jev senza toccare il codice; con un indirizzo locale la chiave
+non serve.
+
 La chiave si legge dalle impostazioni o da ``TYPESAFE_API_KEY`` e **non compare mai** nei
 messaggi d'errore né nei log. Solo HTTP (httpx, già presente): l'SDK non serve.
 """
@@ -29,8 +34,8 @@ from typing import Any
 
 import httpx
 
-URL = "https://api.typesafe.ai/v1/systemone"
-MODEL = "jev-latest"
+from bookwriter.config import JEV_DEFAULT_MODEL as MODEL  # noqa: E402
+from bookwriter.config import JEV_DEFAULT_URL as URL  # noqa: E402
 KEY_ENV = "TYPESAFE_API_KEY"
 
 #: I livelli della domanda, dal peggiore al migliore: la risposta è un punteggio da 0 a 3.
@@ -108,25 +113,30 @@ def _clean(message: str, key: str) -> str:
 class JevClient:
     """Una richiesta alla volta a Jev. Non tiene la chiave in nessun messaggio."""
 
-    def __init__(self, key: str, *, timeout_s: float = 20.0) -> None:
+    def __init__(self, key: str, *, timeout_s: float = 20.0, url: str = URL,
+                 model: str = MODEL) -> None:
         self._key = key
         self.timeout_s = timeout_s
+        self.url = url or URL
+        self.model = model or MODEL
 
     def __repr__(self) -> str:  # la chiave non finisce nei log nemmeno per sbaglio
-        return f"JevClient(timeout_s={self.timeout_s})"
+        return f"JevClient(url={self.url!r}, model={self.model!r}, timeout_s={self.timeout_s})"
 
     def score(self, state: str, meter: JevMeter | None = None) -> tuple[float, float]:
         """``(punteggio 0-3, confidenza 0-1)`` per lo stato dato. Solleva :class:`JevError`."""
         corpo = {
-            "state": state, "model": MODEL,
+            "state": state, "model": self.model,
             "questions": {QUESTION_ID: {"type": "score", "instructions": INSTRUCTIONS,
                                         "criteria": CRITERIA}},
         }
         t0 = time.perf_counter()
         try:
             with httpx.Client(timeout=self.timeout_s) as c:
-                r = c.post(URL, json=corpo, headers={
-                    "Authorization": f"Bearer {self._key}", "Content-Type": "application/json"})
+                intestazioni = {"Content-Type": "application/json"}
+                if self._key:
+                    intestazioni["Authorization"] = f"Bearer {self._key}"
+                r = c.post(self.url, json=corpo, headers=intestazioni)
         except httpx.HTTPError as exc:
             if meter:
                 meter.failed()
@@ -187,10 +197,12 @@ def split_sections(text: str, max_len: int = SECTION_CHARS) -> list[str]:
 class JevSession:
     """Jev per un lavoro (un capitolo): il client, le soglie e il conto di quanto si spende."""
 
-    def __init__(self, client: JevClient, *, min_score: float, max_chars: int) -> None:
+    def __init__(self, client: JevClient, *, min_score: float, max_chars: int,
+                 parallel: int = PARALLEL) -> None:
         self.client = client
         self.min_score = min_score
         self.max_chars = max(200, int(max_chars))
+        self.parallel = max(1, int(parallel))
         self.meter = JevMeter()
 
     def _state(self, context: str, text: str) -> str:
@@ -213,7 +225,7 @@ class JevSession:
             passo = len(indici) / MAX_SECTIONS
             indici = sorted({int(i * passo) for i in range(MAX_SECTIONS)})
         try:
-            with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
+            with ThreadPoolExecutor(max_workers=self.parallel) as pool:
                 punteggi = list(pool.map(
                     lambda i: self.client.score(self._state(context, sezioni[i]), self.meter)[0],
                     indici))
@@ -234,13 +246,26 @@ class JevSession:
         return "\n\n[…]\n\n".join(sezioni[i] for i in sorted(scelte))
 
 
+def is_local(url: str) -> bool:
+    """Un servizio sul computer dell'autore (o nella sua rete): lì la chiave non serve."""
+    from urllib.parse import urlparse
+
+    host = (urlparse(url or "").hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1") or host.endswith(".local") \
+        or host.startswith(("192.168.", "10."))
+
+
 def session(settings: Any) -> JevSession | None:
-    """La sessione Jev per queste impostazioni, o ``None`` se Jev è spento o manca la chiave."""
+    """La sessione Jev per queste impostazioni, o ``None`` se Jev è spento o manca la chiave
+    (per un servizio remoto: uno locale non la chiede)."""
     if not getattr(settings, "jev_enabled", False):
         return None
+    url = str(getattr(settings, "jev_url", "") or URL).strip()
     chiave = api_key_for(settings)
-    if not chiave:
+    if not chiave and not is_local(url):
         return None
-    return JevSession(JevClient(chiave, timeout_s=float(getattr(settings, "jev_timeout_s", 20.0))),
-                      min_score=float(getattr(settings, "jev_min_score", 0.8)),
-                      max_chars=int(getattr(settings, "jev_max_chars", 6000)))
+    cliente = JevClient(chiave, timeout_s=float(getattr(settings, "jev_timeout_s", 20.0)),
+                        url=url, model=str(getattr(settings, "jev_model", "") or MODEL))
+    return JevSession(cliente, min_score=float(getattr(settings, "jev_min_score", 0.8)),
+                      max_chars=int(getattr(settings, "jev_max_chars", 6000)),
+                      parallel=int(getattr(settings, "jev_parallel", PARALLEL)))

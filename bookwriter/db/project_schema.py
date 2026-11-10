@@ -251,6 +251,10 @@ class QueuedBookRow(SQLModel, table=True):
     style_profile_id: int | None = None
     ratio: float | None = None
     critic: bool = True
+    literary: bool | None = None  # None = come decide il motore (sì se si traduce)
+    polish: bool | None = None
+    form: str | None = "keep"  # keep | prose_from_verse
+    modernize: bool | None = False
     state: str = "in attesa"
     detail: str = ""
     created_at: str = Field(default_factory=_now_iso)
@@ -302,6 +306,65 @@ class OutlineItem(SQLModel, table=True):
     node_id: int = Field(foreign_key="node.id")
 
 
+class NodeMerge(SQLModel, table=True):
+    """Traccia di un'idea fusa in un'altra perché diceva la stessa cosa (deduplicazione semantica).
+
+    L'idea assorbita sparisce dall'elenco, ma non dal progetto: qui resta la sua copia completa
+    (testo, sintesi, temi, documento e blocco di provenienza), il motivo della fusione e lo stato
+    dell'idea che l'ha assorbita prima della fusione. Così ogni fusione si può leggere e annullare.
+    """
+
+    __tablename__ = "node_merge"
+
+    id: int | None = Field(default=None, primary_key=True)
+    kept_node_id: int = Field(index=True)
+    merged_node_id: int = Field(index=True)  # id che aveva l'idea assorbita (non più in ``node``)
+    similarity: float = 0.0
+    reason: str = ""
+    details_added: bool = False  # il testo dell'assorbita è stato accodato a quella tenuta
+    merged_snapshot: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    kept_before: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    status: str = "merged"  # merged|restored
+    created_at: str = Field(default_factory=_now_iso)
+
+
+class NodePairCheck(SQLModel, table=True):
+    """Coppia di idee già giudicata dal modello, per non chiederla di nuovo a ogni esecuzione.
+
+    ``kind`` distingue il giudizio: ``duplicate`` (stessa idea o no) e ``link`` (quale legame
+    logico). ``verdict`` conserva l'esito, anche quando è «nessuno»: è proprio quello che evita
+    di ripagare la stessa domanda.
+    """
+
+    __tablename__ = "node_pair_check"
+
+    id: int | None = Field(default=None, primary_key=True)
+    kind: str = Field(index=True)  # duplicate|link
+    node_a: int = Field(index=True)
+    node_b: int = Field(index=True)
+    verdict: str = ""
+    created_at: str = Field(default_factory=_now_iso)
+
+
+class OutlinePlan(SQLModel, table=True):
+    """Piano ragionato di una struttura nata da scopo e lettore dichiarati.
+
+    Le tabelle dell'outline sanno solo *dove* sta ogni idea. Qui sta il *perché*: lo scopo, il
+    lettore, le parti, l'obiettivo e la transizione di ogni capitolo, i capitoli previsti rimasti
+    senza materiale. La stesura lo rilegge per scrivere ogni capitolo sapendo a cosa serve.
+    """
+
+    __tablename__ = "outline_plan"
+
+    id: int | None = Field(default=None, primary_key=True)
+    outline_id: int = Field(index=True)
+    purpose: str = ""
+    reader: str = ""
+    style_profile_id: int | None = None
+    data: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: str = Field(default_factory=_now_iso)
+
+
 class TokenUsage(SQLModel, table=True):
     """Token consumati da una singola esecuzione (per attività e modello). Vedi §12.5."""
 
@@ -343,7 +406,13 @@ _PROJECT_TABLES = [
     RewriteChunk.__table__,  # type: ignore[attr-defined]
     QueuedBookRow.__table__,  # type: ignore[attr-defined]
     TokenUsage.__table__,  # type: ignore[attr-defined]
+    NodeMerge.__table__,  # type: ignore[attr-defined]
+    NodePairCheck.__table__,  # type: ignore[attr-defined]
+    OutlinePlan.__table__,  # type: ignore[attr-defined]
 ]
+
+#: Tabelle nate con la lavorazione semantica degli appunti: i progetti più vecchi non le hanno.
+NOTES_TABLES = (NodeMerge, NodePairCheck, OutlinePlan)
 
 
 def make_engine(db_path: Path) -> Engine:
@@ -382,7 +451,18 @@ def init_project_db(db_path: Path) -> Engine:
     # senza migrazioni da eseguire a mano.
     ensure_columns(engine, Document)
     ensure_columns(engine, QueuedBookRow)
+    ensure_notes_tables(engine)
     return engine
+
+
+def ensure_notes_tables(engine: Engine) -> None:
+    """Crea, se mancano, le tabelle di fusioni, giudizi sulle coppie e piani di struttura.
+
+    Le funzioni che le usano la chiamano da sé: un progetto creato prima non passa da
+    :func:`init_project_db` e deve funzionare lo stesso.
+    """
+    for model in NOTES_TABLES:
+        ensure_columns(engine, model)
 
 
 # --- helper BookSpec (target di parole) ------------------------------------

@@ -51,8 +51,30 @@ def find_bun() -> str | None:
 
 
 
+#: Perché l'ultimo avvio non è riuscito (vuoto se è riuscito): la finestra lo dice.
+last_error: str = ""
+
+
+def _candidates() -> list[Path]:
+    """Dove può stare TRAWL: la variabile ``BOOKWRITER_TRAWL_DIR``, accanto ai sorgenti, accanto
+    all'eseguibile compilato e risalendo da lì (``dist/bookwriter/bookwriter.exe`` sta due
+    cartelle sotto il progetto, dove c'è ``tools/trawl``)."""
+    import sys
+
+    fuori: list[Path] = []
+    if env := os.environ.get("BOOKWRITER_TRAWL_DIR", "").strip():
+        fuori.append(Path(env))
+    for base in (Path(__file__).resolve(), Path(sys.executable).resolve()):
+        for genitore in list(base.parents)[:5]:
+            fuori.append(genitore / "tools" / "trawl")
+    return fuori
+
+
 def trawl_dir() -> Path:
-    """Restituisce la cartella in cui si trova TRAWL all'interno del progetto."""
+    """La cartella di TRAWL: la prima delle candidate che contiene il servizio."""
+    for c in _candidates():
+        if (c / "apps" / "api" / "src" / "index.ts").is_file():
+            return c
     return Path(__file__).resolve().parents[2] / "tools" / "trawl"
 
 
@@ -74,14 +96,16 @@ def start_trawl(port: int = 8191, wait_ready: bool = True, timeout_s: float = 25
     Se è già in esecuzione (avviato dall'utente separatamente o da una precedente sessione),
     lo riutilizza senza toccarlo.
     """
-    global _process, _managed_by_us
+    global _process, _managed_by_us, last_error
 
     target_url = f"http://127.0.0.1:{port}"
+    last_error = ""
     if is_trawl_running(target_url):
         return True
 
     bun_exe = find_bun()
     if not bun_exe:
+        last_error = "Bun non è installato (winget install Oven-sh.Bun)"
         logger.warning("Bun non trovato nel sistema: impossibile avviare automaticamente TRAWL.")
         return False
 
@@ -89,6 +113,7 @@ def start_trawl(port: int = 8191, wait_ready: bool = True, timeout_s: float = 25
     api_dir = base_dir / "apps" / "api"
     entry_point = api_dir / "src" / "index.ts"
     if not entry_point.is_file():
+        last_error = f"TRAWL non trovato (cercato in {base_dir}): esegui update_trawl.ps1"
         logger.warning("File di avvio di TRAWL non trovato: %s", entry_point)
         return False
 
@@ -119,6 +144,7 @@ def start_trawl(port: int = 8191, wait_ready: bool = True, timeout_s: float = 25
         )
         _managed_by_us = True
     except Exception as exc:
+        last_error = f"avvio non riuscito: {exc}"
         logger.error("Errore durante l'avvio di TRAWL: %s", exc)
         return False
 
@@ -131,12 +157,14 @@ def start_trawl(port: int = 8191, wait_ready: bool = True, timeout_s: float = 25
             logger.info("TRAWL avviato e pronto su %s", target_url)
             return True
         if _process.poll() is not None:
+            last_error = f"TRAWL si è chiuso subito (codice {_process.returncode}): vedi trawl.log"
             logger.error("Il processo TRAWL è terminato prematuramente con codice %s", _process.returncode)
             _managed_by_us = False
             _process = None
             return False
         time.sleep(0.5)
 
+    last_error = f"TRAWL non ha risposto entro {timeout_s:.0f} secondi"
     logger.warning("Timeout in attesa dell'avvio di TRAWL dopo %.1f secondi", timeout_s)
     return False
 

@@ -55,6 +55,57 @@ OPENING = (
 )
 
 
+#: L'apertura quando si completa un manoscritto: il libro c'è, si parla di cosa manca.
+OPENING_COMPLETE = (
+    "Ho letto il manoscritto. Dimmi come vuoi completarlo: cosa manca (capitoli nuovi, un "
+    "seguito, un finale, parti rimaste a metà), cosa deve succedere, dove deve arrivare chi "
+    "legge. Le parti nuove avranno la stessa voce e lo stesso stile di quelle che hai già "
+    "scritto.\n\n"
+    "Ti farò domande e ti proporrò strade; quando avrai detto quello che ti preme, chiudi la "
+    "conversazione e il resto lo decido io."
+)
+
+#: L'apertura quando si aggiorna un manoscritto: si parla di cosa cambia, con precisione.
+OPENING_UPDATE = (
+    "Ho letto il manoscritto. Dimmi cosa vuoi cambiare: un luogo, un'epoca, un evento, un "
+    "personaggio, un fatto. Più sei preciso («l'evento all'Empire State Building si sposta "
+    "sulla Torre di Pisa»), meglio seguo le conseguenze in tutto il libro: viaggi, luoghi, "
+    "usanze, clima e stagione, persone incontrate, cibo, leggi, atmosfera.\n\n"
+    "Ti farò domande sulle conseguenze che vedo; quando avrai detto quello che ti preme, "
+    "chiudi la conversazione e il resto lo decido io."
+)
+
+
+def opening_for(state: Any) -> str:
+    """La prima battuta della conversazione, secondo il lavoro: da zero, completa, aggiorna."""
+    return {"completa": OPENING_COMPLETE, "aggiorna": OPENING_UPDATE}.get(
+        getattr(state, "mode", "nuovo"), OPENING)
+
+
+_MANUSCRIPT_COMPLETE = (
+    "## Il lavoro: completare un manoscritto che esiste\n"
+    "Il libro è già in buona parte scritto (lo riassume la sezione qui sotto). Non lo stai "
+    "progettando da zero: capisci cosa manca e come deve continuare o finire, quali capitoli "
+    "vanno aggiunti e dove, quali parti sono rimaste a metà. Il quaderno è già riempito da "
+    "quello che il manoscritto dice: correggilo con l'autore dove lui vuole altro. Il testo "
+    "esistente non si riscrive; le parti nuove devono avere la sua voce."
+)
+
+_MANUSCRIPT_UPDATE = (
+    "## Il lavoro: aggiornare un manoscritto che esiste\n"
+    "Il libro è già scritto (lo riassume la sezione qui sotto). L'autore vuole cambiare "
+    "qualcosa: un luogo, un'epoca, un evento, un personaggio. Il tuo compito è capire con "
+    "precisione OGNI cambiamento (cosa diventa cosa) e seguirne con lui le conseguenze: "
+    "dove il libro ne parla, cosa cambia di riflesso (viaggi, biglietti, percorsi, luoghi "
+    "visitati, persone incontrate, lingua, cibo, monete e mance, usanze e superstizioni, "
+    "leggi, guida a destra o a sinistra, clima, stagione ed emisfero, meteo del periodo, "
+    "atmosfera). Proponi le conseguenze che vedi e chiedi conferma; segnala quelle che "
+    "richiedono una scelta dell'autore (es. un personaggio legato al luogo vecchio). Ogni "
+    "cambiamento deciso va in una riga precisa nella sezione «Modifiche da fare». Quello che "
+    "l'autore non cambia resta com'è."
+)
+
+
 class SupportsChat(Protocol):
     def chat(self, messages: list[dict[str, str]], *, model: str | None = ...,
              extra: dict[str, Any] | None = ...,
@@ -151,6 +202,12 @@ def system_prompt(state: ForgeState, *, style: str = "", trimmed: bool = False) 
         _CONDUCT,
         f"## Il quaderno del libro finora\n{quaderno}",
     ]
+    modo = getattr(state, "mode", "nuovo")
+    if modo in ("completa", "aggiorna"):
+        sommario = str((getattr(state, "manuscript", None) or {}).get("summary") or "")
+        parti.insert(1, _MANUSCRIPT_COMPLETE if modo == "completa" else _MANUSCRIPT_UPDATE)
+        if sommario:
+            parti.append(f"## Il manoscritto, capitolo per capitolo\n{sommario}")
     if scoperte:
         parti.append("## Ancora scoperto\n" + ", ".join(scoperte) +
                      "\nNon serve chiederle tutte, né di seguito: ci si arriva dalla conversazione.")

@@ -45,6 +45,16 @@ RISOLTA = "risolta"
 CHIESTA = "chiesta_all_autore"
 DECISA = "decisa"
 
+#: Che tipo di contrasto ha trovato la ricerca. È un'etichetta per chi decide, non un verdetto.
+CONTRAST_CATEGORIES = {
+    "storica": "contraddizione con un fatto storico",
+    "cronologia": "date o ordine degli eventi",
+    "terminologia": "differenza di nomi o termini",
+    "incertezza": "le fonti stesse non concordano",
+    "fonte_debole": "la fonte del contrasto è debole",
+    "fiction": "contraddizione con la storia del libro",
+}
+
 #: Gli stati in cui una questione non ha più bisogno di nessuno.
 CHIUSE = (RISOLTA, DECISA)
 
@@ -92,6 +102,9 @@ class PageRead:
     cleaning: str = ""
     #: scartata dall'autore (vedi ``Hit.discarded``)
     discarded: bool = False
+    #: autore e data di pubblicazione dichiarati dalla pagina (per la bibliografia)
+    author: str = ""
+    published: str = ""
 
 
 @dataclass
@@ -109,6 +122,9 @@ class Finding:
     use: str = ""
     #: l'autore ha deciso, in revisione, che questo materiale non entra: la stesura non lo vede.
     excluded: bool = False
+    #: il modello ha citato una fonte che fra le pagine lette non c'è: l'indirizzo era suo, non
+    #: della ricerca. L'affermazione resta come materiale; la fonte non si cita.
+    unverified: bool = False
 
 
 @dataclass
@@ -133,6 +149,8 @@ class Question:
     attempts: list[Attempt] = field(default_factory=list)
     #: l'esito: ``{"kind": "source"|"publish"|"omit", "text": ..., "source": ..., "url": ...}``.
     outcome: dict[str, str] = field(default_factory=dict)
+    #: che tipo di contrasto è (vedi ``CONTRAST_CATEGORIES``): lo dice la card della decisione.
+    category: str = ""
     #: ``contrasto`` = la ricerca ha trovato un fatto che sembra comprovato in contrasto con
     #: quanto l'autore scrive. Vuoto nei dati salvati prima del riorientamento (allora nascevano da
     #: ciò che il materiale «non documentava», anche per gli elementi d'invenzione).
@@ -503,7 +521,9 @@ def render_chapter_md(data: ChapterData) -> str:
                 righe += [f"- **Tipo di fonte:** {livello} — "
                           f"{EVIDENCE_LEVELS.get(livello, 'non classificato')}"]
             righe += [
-                f"- **Fonte:** {f.source}" + (f" — {f.url}" if f.url else ""),
+                f"- **Fonte:** {f.source}" + (f" — {f.url}" if f.url else "")
+                + (" *(non verificata: non è fra le pagine lette, non citarla)*"
+                   if f.unverified else ""),
                 f"- **Consultata:** {oggi}",
             ]
             if f.origin == "revisione":
@@ -519,7 +539,8 @@ def render_chapter_md(data: ChapterData) -> str:
                   "La ricerca ha trovato qualcosa che sembra in contrasto con quanto il libro "
                   "afferma. **Nel libro resta com'è stato scritto** finché l'autore non decide "
                   "diversamente.", ""]
-        righe += [f"- {q.text}" for q in aperte]
+        righe += [f"- {q.text}" + (f" *({CONTRAST_CATEGORIES.get(q.category, q.category)})*"
+                                   if q.category else "") for q in aperte]
         righe.append("")
 
     decise = [q for q in data.questions if q.status == DECISA]

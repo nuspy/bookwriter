@@ -245,6 +245,7 @@ def test_a_chapter_with_repeated_paragraphs_is_rewritten_once(tmp_path: Path) ->
     f = Forge(tmp_path / "book", AppConfig(), client=ModelloRipetitivo(chapters=3, words=300))
     f.start()
     _pronto_a_scrivere(f)
+    f.state.notebook["form"] = "saggio divulgativo"  # il percorso di una chiamata sola
     for c in f.state.outline:
         c["words"] = 300           # un capitolo breve: una chiamata sola
     risultato = f.write_next()
@@ -258,6 +259,7 @@ def test_if_the_rewrite_still_repeats_the_identical_paragraphs_are_removed(tmp_p
     f.client.sempre = True
     f.start()
     _pronto_a_scrivere(f)
+    f.state.notebook["form"] = "saggio divulgativo"  # il percorso di una chiamata sola
     for c in f.state.outline:
         c["words"] = 300
     risultato = f.write_next()
@@ -352,7 +354,7 @@ def test_a_section_with_repeated_paragraphs_is_rewritten_once(tmp_path: Path) ->
         def chat(self, messages, **kw):
             sistema = messages[0]["content"]
             if "Scrivi UNA SEZIONE" in sistema and "Sezione 1 di" in sistema:
-                if messages[-1]["content"].startswith("Nel testo di questa sezione ci sono ripetizioni"):
+                if messages[-1]["content"].startswith("Nel testo che hai scritto ci sono ripetizioni"):
                     self.rifatte += 1
                     return "## Titolo 1\n\n" + " ".join(["alfaa"] * 1400)
                 p = "Un paragrafo lungo abbastanza da essere contato come ripetizione vera."

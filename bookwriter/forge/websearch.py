@@ -104,6 +104,9 @@ class Page:
     cleaning: str = ""
     #: motivo specifico del blocco se non leggibile (captcha, challenge, http_403, etc.)
     block_reason: str = ""
+    #: autore e data di pubblicazione, dai metadati della pagina (per la bibliografia)
+    author: str = ""
+    published: str = ""
 
     @property
     def usable(self) -> bool:
@@ -343,7 +346,8 @@ def fetch(url: str, settings: ResearchSettings) -> Page | None:
                 if pulita_ext.readable:
                     return Page(url=url, title=titolo_ext, text=pulita_ext.text,
                                 readable=True, note="", removed=dict(pulita_ext.removed),
-                                chars_before=pulita_ext.chars_before, chars_after=pulita_ext.chars_after)
+                                chars_before=pulita_ext.chars_before, chars_after=pulita_ext.chars_after,
+                                author=pulita_ext.author, published=pulita_ext.published)
         return Page(url=url, title=url, text="", readable=False, note=http_error_msg,
                     block_reason=block_reason)
 
@@ -355,7 +359,8 @@ def fetch(url: str, settings: ResearchSettings) -> Page | None:
         return Page(url=url, title=titolo, text=pulita.text,
                     readable=True, note="",
                     removed=dict(pulita.removed), chars_before=pulita.chars_before,
-                    chars_after=pulita.chars_after)
+                    chars_after=pulita.chars_after,
+                    author=pulita.author, published=pulita.published)
 
     # La pagina scaricata non è leggibile: verifichiamo se è un blocco
     block_reason = blocked.detect_block_reason(url, html=html, clean_reason=pulita.reason)
@@ -375,7 +380,8 @@ def fetch(url: str, settings: ResearchSettings) -> Page | None:
             if pulita_ext.readable:
                 return Page(url=url, title=titolo_ext, text=pulita_ext.text,
                             readable=True, note="", removed=dict(pulita_ext.removed),
-                            chars_before=pulita_ext.chars_before, chars_after=pulita_ext.chars_after)
+                            chars_before=pulita_ext.chars_before, chars_after=pulita_ext.chars_after,
+                            author=pulita_ext.author, published=pulita_ext.published)
 
     return Page(url=url, title=titolo, text="",
                 readable=False, note=pulita.reason,

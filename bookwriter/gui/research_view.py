@@ -51,6 +51,18 @@ def status_words() -> dict[str, str]:
     }
 
 
+def category_words() -> dict[str, str]:
+    """Il tipo di un contrasto, nella lingua dell'interfaccia: un'etichetta per chi decide."""
+    return {
+        "storica": t("contraddizione con un fatto storico"),
+        "cronologia": t("date o ordine degli eventi"),
+        "terminologia": t("differenza di nomi o termini"),
+        "incertezza": t("le fonti stesse non concordano"),
+        "fonte_debole": t("la fonte del contrasto è debole"),
+        "fiction": t("contraddizione con la storia del libro"),
+    }
+
+
 def _link(url: str, title: str) -> str:
     """Un indirizzo apribile. Solo http(s): un file di nome `x.pdf` (un documento dell'autore)
     resta testo."""
@@ -203,7 +215,8 @@ class PointBox(QGroupBox):
             parole = status_words()
             for q in mie:
                 stato_q = t("scartata") if q.discarded else parole.get(q.status, q.status)
-                riga = QLabel(f"• {q.text} — {stato_q}")
+                tipo = category_words().get(q.category, "") if q.category else ""
+                riga = QLabel(f"• {q.text} — {stato_q}" + (f" ({tipo})" if tipo else ""))
                 riga.setWordWrap(True)
                 riga_q = QHBoxLayout()
                 riga_q.addWidget(riga, 1)

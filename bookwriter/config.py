@@ -22,6 +22,10 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
+#: Il servizio dei giudizi rapidi (Jev, TypeSafe) e il suo modello: i valori predefiniti, che
+#: si cambiano in Impostazioni per un servizio compatibile (anche locale).
+JEV_DEFAULT_URL = "https://api.typesafe.ai/v1/systemone"
+JEV_DEFAULT_MODEL = "jev-latest"
 CONFIG_FILENAME = "config.toml"
 
 # Fornitori del servizio di intelligenza artificiale, presi dal registro comune di ``llmswitch``:
@@ -141,6 +145,16 @@ class ModelRoles(BaseModel):
     reasoning: str = "qwen3-8b-instruct"
     embedding: str = "text-embedding-nomic-embed-text-v1.5"
     heavy: str = ""
+    #: Il modello dei **controlli** della stesura (continuità del piano, registro degli eventi,
+    #: etichette del significato, griglia): vuoto = lo stesso che scrive. Un giudizio dello
+    #: stesso modello che ha scritto non è una verifica indipendente; un altro modello sì, se
+    #: l'autore ne ha uno. L'applicazione non lo carica: lo chiede al server, come gli altri.
+    review: str = ""
+
+    @property
+    def checker(self) -> str:
+        """Il modello dei controlli: ``review`` se impostato, altrimenti quello che scrive."""
+        return self.review or self.reasoning
 
     @property
     def quality(self) -> str:
@@ -206,6 +220,11 @@ class LLMConfig(BaseModel):
     #: un livello ("low", "medium", "high"…) o "" per lasciar decidere al server. Il livello
     #: ``reasoning_effort`` resta quello di estrazione, conversazione e stesura.
     reasoning_effort_quick: str = "same"
+    #: Quanto ragiona la **stesura** (piano delle scene, scrittura, passaggi editoriali, registro
+    #: della continuità): ``"same"`` (predefinito) = lo stesso livello di ``reasoning_effort``;
+    #: altrimenti un livello, o "" per lasciar decidere al server. Serve a chi tiene basso il
+    #: livello generale per la ricerca ma vuole che il libro si scriva ragionando.
+    reasoning_effort_writing: str = "same"
     #: Come si dichiara al server che la risposta deve essere JSON: ``json_schema`` (lo schema
     #: nel ``response_format``, predefinito), ``json_object`` (JSON qualsiasi, lo schema nel
     #: prompt) o ``text`` (solo il prompt). Per un server personalizzato vale quello della sua
@@ -217,9 +236,12 @@ class LLMConfig(BaseModel):
     # libro fallito a due brani dalla fine — e un `max_tokens` rimasto in un vecchio
     # config.toml viene semplicemente ignorato.
 
-    def reasoning_for(self, quick: bool = False) -> str:
-        """Il livello di ragionamento di un compito: quello rapido, se è un compito rapido e ne è
-        stato scelto uno suo; altrimenti quello generale. ``""`` = lascia decidere al server."""
+    def reasoning_for(self, quick: bool = False, writing: bool = False) -> str:
+        """Il livello di ragionamento di un compito: quello rapido o quello della stesura, se è
+        un compito di quel tipo e ne è stato scelto uno suo; altrimenti quello generale. ``""`` =
+        lascia decidere al server."""
+        if writing and self.reasoning_effort_writing != "same":
+            return self.reasoning_effort_writing
         if quick and self.reasoning_effort_quick != "same":
             return self.reasoning_effort_quick
         return self.reasoning_effort
@@ -314,6 +336,9 @@ class ChunkingConfig(BaseModel):
 
     target_tokens: int = 1500
     overlap_sentences: int = 1
+    #: dove gira la trascrizione dei file audio importati: «cpu» o «cuda». Lo sceglie l'autore
+    #: nel passo Importa; la GPU è molto più veloce ma occupa memoria accanto al modello.
+    audio_device: str = "cpu"
 
 
 #: Motori di ricerca utilizzabili nella fase di ricerca. Il primo non chiede nulla a nessuno;
@@ -324,6 +349,10 @@ SEARCH_ENGINES: list[tuple[str, str]] = [
     ("tavily", "Tavily — con chiave (TAVILY_API_KEY), pensato per gli assistenti"),
     ("searxng", "SearXNG — la tua istanza, indirizzo da indicare"),
 ]
+
+
+#: L'indirizzo di TRAWL quando lo avvia l'applicazione.
+LOCAL_FETCHER = "http://127.0.0.1:8191/v1"
 
 
 class ResearchSettings(BaseModel):
@@ -366,6 +395,13 @@ class ResearchSettings(BaseModel):
     #: La chiave si può anche dare con la variabile d'ambiente ``TYPESAFE_API_KEY``.
     jev_enabled: bool = False
     jev_api_key: str = ""
+    #: Il servizio dei giudizi rapidi: l'API «System One» di TypeSafe (``state`` + domande
+    #: tipizzate → punteggi). Indirizzo e modello si cambiano qui per usare un servizio
+    #: compatibile, anche locale: con un indirizzo locale la chiave non è obbligatoria.
+    jev_url: str = JEV_DEFAULT_URL
+    jev_model: str = JEV_DEFAULT_MODEL
+    #: Richieste insieme a Jev (le sezioni di una pagina lunga si giudicano in parallelo).
+    jev_parallel: int = Field(default=4, ge=1, le=16)
     #: Sotto questo punteggio (scala 0-3 di Jev: 0 fuori tema, 1 appena legata, 2 utile, 3 molto
     #: utile) una pagina è «non pertinente».
     jev_min_score: float = Field(default=0.8, ge=0, le=3)
@@ -380,6 +416,8 @@ class UISettings(BaseModel):
 
     language: str = "it"  # codice di UI_LANGUAGES
     last_export_dir: str = ""  # cartella dell'ultimo salvataggio, riproposta la volta dopo
+    #: l'aspetto: ``auto`` (segue il sistema), ``light`` (giorno) o ``dark`` (notte)
+    theme: str = "auto"
 
 
 class ProjectSettings(BaseModel):
@@ -439,6 +477,17 @@ class WritingSettings(BaseModel):
     section_words: int = 1500
 
 
+class QualitySettings(BaseModel):
+    """La verifica della qualità (vedi :mod:`bookwriter.forge.quality`)."""
+
+    #: Il voto globale (0-10) da cui un capitolo è accettato.
+    min_global: float = Field(default=7.0, ge=0, le=10)
+    #: Il voto minimo di ogni criterio critico per il tipo di libro.
+    min_critical: float = Field(default=6.0, ge=0, le=10)
+    #: I giri di correzione automatici; oltre, ogni giro lo autorizza l'autore.
+    max_rounds: int = Field(default=3, ge=0, le=20)
+
+
 class AppConfig(BaseModel):
     """Configurazione completa (globale o di progetto)."""
 
@@ -449,6 +498,7 @@ class AppConfig(BaseModel):
     production: ProductionSettings = Field(default_factory=ProductionSettings)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
     writing: WritingSettings = Field(default_factory=WritingSettings)
+    quality: QualitySettings = Field(default_factory=QualitySettings)
     ui: UISettings = Field(default_factory=UISettings)
 
     @classmethod

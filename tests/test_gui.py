@@ -13,7 +13,7 @@ pytest.importorskip("PySide6")
 
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from bookwriter.forge import saves as fg_saves
 from bookwriter.gui.main_window import MainWindow
@@ -42,27 +42,58 @@ def niente_rete_verso_i_fornitori(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_mainwindow_builds(qapp, temp_workspace: Path) -> None:
     win = MainWindow()
-    assert win.tabs.count() == 15
+    # Le schede di primo livello sono i lavori; dentro, le loro sotto-schede.
     titles = [win.tabs.tabText(i) for i in range(win.tabs.count())]
-    # Titoli funzionali (orientati al compito dell'utente), non ai nomi interni del motore.
-    for expected in (
-        "Importa testi",
-        "Prepara contenuti",
-        "Componi il libro",
-        "Struttura (modifica)",
-        "Stile di scrittura",
-        "Completa i contenuti",
-        "Riepilogo progetto",
-        "Riscrivi in altro stile",
-        "Traduci",
-        "Coda di lavorazione",
-        "Leggi il libro",
-        "Scrivi da zero",
-        "Aggiorna un libro",
-        "Consumi dei modelli",
-        "Impostazioni",
-    ):
-        assert any(expected in t for t in titles), expected
+    assert titles == ["Scrivi libro da appunti", "Scrivi da zero", "Completa un libro",
+                      "Aggiorna un libro", "Riscrivi in altro stile", "Traduci",
+                      "Stile di scrittura", "Leggi anteprima in lavorazione", "Qualità",
+                      "Utilità"]
+    sotto = {win.tabs.tabText(i): [st.tabText(j) for j in range(st.count())]
+             for i, st in win._subtabs.items()}
+    assert sotto == {
+        "Scrivi libro da appunti": ["1 · Importa testi", "2 · Prepara contenuti", "3 · Struttura",
+                                    "4 · Componi il libro", "Riepilogo progetto"],
+        "Completa un libro": ["Completa (a fasi)", "Lacune negli appunti"],
+        "Aggiorna un libro": ["Aggiorna (a fasi)", "Integra dagli appunti"],
+        "Qualità": ["Un capitolo", "Il libro intero", "Struttura del libro"],
+        "Utilità": ["Coda di lavorazione", "Consumi dei modelli", "Impostazioni"],
+    }
+    assert all(not win.tabs.tabIcon(i).isNull() for i in range(win.tabs.count())), "le icone"
+    win.close()
+
+
+def test_the_phased_panel_serves_three_jobs_each_with_its_own_book(
+    qapp, temp_workspace: Path,
+) -> None:
+    """Da zero, completa, aggiorna: lo stesso pannello a fasi, tre libri separati."""
+    win = MainWindow()
+    win.pm.create("Tre lavori")
+    win._reload_projects()
+    for titolo, modo in (("Completa un libro", "completa"), ("Aggiorna un libro", "aggiorna"),
+                         ("Scrivi da zero", "nuovo")):
+        win.tabs.setCurrentIndex(next(i for i in range(win.tabs.count())
+                                      if win.tabs.tabText(i) == titolo))
+        assert win._forge_mode == modo
+        assert win._forge_page.parentWidget() is win._forge_hosts[modo]
+        assert win._forge().project.root.name == {"nuovo": "book"}.get(modo, modo)
+        assert win.fg_manuscript.isHidden() == (modo == "nuovo")
+    win.close()
+
+
+def test_day_night_and_auto_themes_keep_text_readable(qapp, temp_workspace: Path) -> None:
+    from bookwriter.config import load_global_config
+    from bookwriter.gui import theme
+
+    for toni in (theme.LIGHT, theme.DARK):
+        assert min(theme.check_contrast(toni).values()) >= 4.5
+    win = MainWindow()
+    win.theme_combo.setCurrentIndex(win.theme_combo.findData("dark"))
+    assert load_global_config().ui.theme == "dark"
+    from PySide6.QtGui import QPalette
+
+    assert qapp.palette().color(QPalette.ColorRole.Window).lightness() < 128
+    win.theme_combo.setCurrentIndex(win.theme_combo.findData("light"))
+    assert qapp.palette().color(QPalette.ColorRole.Window).lightness() > 128
     win.close()
 
 
@@ -309,30 +340,33 @@ def test_ui_language_switch_translates_and_persists(qapp, temp_workspace: Path) 
     win = MainWindow()
     win.pm.create("Progetto lingua")
     assert i18n.current_language() == "it"
-    assert win.tabs.tabText(0) == "1 · Importa testi"
+    assert win._subtabs[0].tabText(0) == "1 · Importa testi"
 
     win.ui_lang_combo.setCurrentIndex(win.ui_lang_combo.findData("en"))
     assert i18n.current_language() == "en"
-    assert win.tabs.tabText(0) == "1 · Import texts"
-    assert win.tabs.tabText(14) == "Settings"
+    assert win._subtabs[0].tabText(0) == "1 · Import texts"
+    ultima = win.tabs.count() - 1
+    assert win._subtabs[ultima].tabText(2) == "Settings"
     assert load_global_config().ui.language == "en"  # ricordata per la prossima sessione
 
     win.ui_lang_combo.setCurrentIndex(win.ui_lang_combo.findData("hu"))
-    assert win.tabs.tabText(0) == "1 · Szövegek importálása"
-    assert win.tabs.tabText(1) == "2 · Tartalom előkészítése"
+    assert win._subtabs[0].tabText(0) == "1 · Szövegek importálása"
+    assert win._subtabs[0].tabText(1) == "2 · Tartalom előkészítése"
 
     win.ui_lang_combo.setCurrentIndex(win.ui_lang_combo.findData("ja"))
-    assert win.tabs.tabText(0) == "1・テキストを取り込む"
-    assert win.tabs.tabText(1) == "2・コンテンツを準備する"
+    assert win._subtabs[0].tabText(0) == "1・テキストを取り込む"
+    assert win._subtabs[0].tabText(1) == "2・コンテンツを準備する"
 
     win.ui_lang_combo.setCurrentIndex(win.ui_lang_combo.findData("it"))
-    assert win.tabs.tabText(0) == "1 · Importa testi"
+    assert win._subtabs[0].tabText(0) == "1 · Importa testi"
     win.close()
     i18n.set_language("it")
 
 
 def test_ui_language_catalogs_cover_every_key(qapp, temp_workspace: Path) -> None:
-    """Ogni lingua elencata ha il suo catalogo e nessuna voce vuota."""
+    """Ogni lingua elencata ha il suo catalogo e nessuna voce vuota. L'inglese è completo; gli
+    altri cataloghi possono avere meno voci (ricadono sull'inglese), mai voci che l'inglese non
+    ha."""
     import json
 
     from bookwriter.gui import i18n
@@ -343,7 +377,7 @@ def test_ui_language_catalogs_cover_every_key(qapp, temp_workspace: Path) -> Non
     reference = json.loads((i18n.LOCALES_DIR / "en.json").read_text(encoding="utf-8"))
     for code in codes:
         data = json.loads((i18n.LOCALES_DIR / f"{code}.json").read_text(encoding="utf-8"))
-        assert set(data) == set(reference), f"{code}: chiavi diverse dall'inglese"
+        assert set(data) <= set(reference), f"{code}: chiavi che l'inglese non ha"
         assert all(v.strip() for v in data.values()), f"{code}: traduzioni vuote"
 
 
@@ -939,8 +973,9 @@ def test_long_jobs_can_be_interrupted(qapp, temp_workspace: Path) -> None:
     win.close()
 
 
-def test_every_language_translates_every_visible_string() -> None:
-    """Un'interfaccia mezza tradotta è peggio di una non tradotta: si controlla, non si spera."""
+def test_english_translates_every_visible_string() -> None:
+    """Il desktop si mantiene in italiano e inglese (decisione dell'autore, 25/10/2026): ogni
+    scritta visibile ha la sua voce inglese. Le altre lingue ricadono sull'inglese."""
     import ast
     import json
 
@@ -956,12 +991,24 @@ def test_every_language_translates_every_visible_string() -> None:
     # t() restituisce l'originale, che è già quello giusto.
     da_tradurre = {k for k in chiavi if any(c.isalpha() for c in k.replace("PDF", ""))}
 
-    for codice, nome in UI_LANGUAGES:
-        if codice == "it":  # è la lingua delle chiavi: non ha catalogo
-            continue
-        catalogo = json.loads((LOCALES_DIR / f"{codice}.json").read_text(encoding="utf-8"))
-        mancanti = sorted(da_tradurre - set(catalogo))
-        assert not mancanti, f"{nome} ({codice}) senza traduzione per: {mancanti[:5]}"
+    assert ("en", "English") in UI_LANGUAGES
+    catalogo = json.loads((LOCALES_DIR / "en.json").read_text(encoding="utf-8"))
+    mancanti = sorted(da_tradurre - set(catalogo))
+    assert not mancanti, f"English (en) senza traduzione per: {mancanti[:5]}"
+
+
+def test_a_string_missing_in_another_language_falls_back_to_english() -> None:
+    from bookwriter.gui import i18n
+
+    try:
+        i18n.set_language("ja")
+        i18n._catalog.pop("Analizza il libro", None)
+        assert i18n.t("Analizza il libro") == "Analyse the book"
+        assert i18n.t("una chiave che non c'è") == "una chiave che non c'è"
+        i18n.set_language("en")
+        assert i18n.t("Analizza il libro") == "Analyse the book"
+    finally:
+        i18n.set_language("it")
 
 
 def test_the_opening_of_the_conversation_is_translated_everywhere() -> None:
@@ -1581,7 +1628,9 @@ def test_research_starts_by_itself_and_warns_when_the_web_is_off(
     assert not win.fg_status_redo.isHidden(), "«Rifai la ricerca»"
     # il pulsante porta alla scheda Impostazioni
     win._forge_open_settings()
-    assert win.tabs.tabText(win.tabs.currentIndex()) == "Impostazioni"
+    assert win.tabs.tabText(win.tabs.currentIndex()) == "Utilità"
+    sotto = win._subtabs[win.tabs.currentIndex()]
+    assert sotto.tabText(sotto.currentIndex()) == "Impostazioni"
     win.close()
 
 
@@ -2021,10 +2070,11 @@ def test_the_composer_placeholder_is_readable_in_both_themes(qapp) -> None:
         QApplication.setPalette(anteriore)
 
 
-def test_entering_research_with_the_old_format_redoes_it_from_scratch(
+def test_a_research_done_in_the_old_format_does_not_restart_by_itself(
     qapp, temp_workspace: Path, monkeypatch,
 ) -> None:
-    """Il caso vero: una ricerca fatta nel formato di prima (solo .md) si rifà entrando in Ricerca."""
+    """Una ricerca fatta nel formato di prima (solo .md) è un lavoro concluso: entrando in Ricerca
+    non riparte da sola (regola dell'autore, 25/10/2026); la rifà «Rifai la ricerca»."""
     win = MainWindow()
     _libro_con_ricerca(win, monkeypatch)
     forge = win._forge()
@@ -2032,13 +2082,48 @@ def test_entering_research_with_the_old_format_redoes_it_from_scratch(
     for json_file in rd.glob("*.json"):
         json_file.unlink()                       # com'era prima: restano i .md
     assert forge.research_format_old()
+    partenze: list[int] = []
+    originale = win._forge_research_all
+    monkeypatch.setattr(win, "_forge_research_all", lambda **k: partenze.append(1))
     win._forge_go("spec")
-    win._forge_go("research")                    # parte da sola, anche se «fatta»
+    win._forge_go("research")
+    assert partenze == [], "una ricerca conclusa non riparte da sola"
 
+    monkeypatch.setattr(win, "_forge_research_all", originale)
+    win._forge_research_all(mode="redo")         # «Rifai la ricerca»
     forge = win._forge()
     assert forge.landscape_data() is not None, "anche il panorama, che era solo .md"
     assert forge.chapter_data(1) is not None and forge.state.research_done
     assert not forge.research_format_old()
+    win.close()
+
+
+def test_research_starts_by_itself_only_after_the_spec_is_concluded_or_skipped(
+    qapp, temp_workspace: Path, monkeypatch,
+) -> None:
+    """Il primo avvio da solo vuole la fase prima conclusa: specifica approvata, o chiusa a mano
+    dall'autore («passa avanti lo stesso»). Guardare la fase Ricerca non basta."""
+    win = MainWindow()
+    _scheda_libro(win, monkeypatch)
+    _fino_alla_specifica(win)
+    win._forge_make_spec()                       # scritta, non approvata
+    partenze: list[int] = []
+    monkeypatch.setattr(win, "_forge_research_all", lambda **k: partenze.append(1))
+    win._forge_go("research")                    # l'autore guarda la fase: non parte
+    assert partenze == []
+    forge = win._forge()
+    assert not forge.can_autostart_research()
+
+    win._forge_go("spec")
+    monkeypatch.setattr("bookwriter.gui.main_window.QMessageBox.question",
+                        lambda *a, **k: QMessageBox.StandardButton.Yes)
+    forge = win._forge()
+    forge.state.spec_approved = False
+    forge.save()
+    win._forge_advance()                         # manca l'approvazione: «passa avanti lo stesso»
+    forge = win._forge()
+    assert forge.state.phase == "research" and "spec" in forge.state.skipped
+    assert partenze == [1], "la specifica chiusa a mano vale come conclusa"
     win.close()
 
 
@@ -2071,4 +2156,113 @@ def test_a_new_structure_reuses_the_landscape_and_redoes_only_the_chapter_resear
     assert chiamate == [], "il panorama c'è già: non si rifà"
     assert forge.state.research_done
     assert forge.chapter_data(2) is not None and forge.state.outline[1]["title"] == "Un secondo capitolo diverso"
+    win.close()
+
+
+def test_the_editorial_reports_list_the_chapters_to_review_first(tmp_path: Path) -> None:
+    """Il pulsante dei resoconti non apre una cartella muta: elenca i capitoli, quelli da
+    rivedere in testa, con il resoconto e il piano a un clic."""
+    from types import SimpleNamespace
+
+    from bookwriter.forge import editor as ed
+    from bookwriter.forge.project import BookProject, ForgeState, status
+
+    progetto = BookProject(tmp_path / "book")
+    progetto.chapters_dir.mkdir(parents=True)
+    progetto.editorial_dir.mkdir(parents=True)
+    progetto.plans_dir.mkdir(parents=True)
+    for nome, titolo in (("01_inizio", "Inizio"), ("02_scavo", "Scavo"), ("03_corte", "Corte")):
+        (progetto.chapters_dir / f"{nome}.md").write_text(f"# {titolo}\n\nUno due tre.",
+                                                          encoding="utf-8")
+    (progetto.editorial_dir / "01_inizio.md").write_text(
+        ed.EditorialReport(chapter=1).markdown(), encoding="utf-8")
+    (progetto.editorial_dir / "02_scavo.md").write_text(
+        ed.EditorialReport(chapter=2, failed_critical=["protagonista attivo"]).markdown(),
+        encoding="utf-8")
+    (progetto.plans_dir / "02_scavo.json").write_text("{}", encoding="utf-8")
+    stato = ForgeState()
+    stato.outline = [{"number": 1, "title": "Inizio"}, {"number": 2, "title": "Scavo"},
+                     {"number": 3, "title": "Corte"}]
+    forge = SimpleNamespace(project=progetto, state=stato, status=lambda: status(progetto))
+
+    testo = MainWindow._forge_reports_markdown(None, forge)
+    righe = [r for r in testo.splitlines() if r.startswith("- **")]
+    assert [r[4:6] for r in righe] == ["2.", "1.", "3."]
+    assert "protagonista attivo" in righe[0] and "02_scavo.json" in righe[0]
+    assert "02_scavo.md" in righe[0] and righe[0].count("file:") == 3
+    assert "senza resoconto" in righe[2]
+
+
+def test_a_running_translation_asks_the_author_through_the_window(qapp, tmp_path, monkeypatch) -> None:
+    """La domanda sui modi di dire parte dal thread di lavoro, si apre nella finestra e la
+    risposta torna al lavoro; con «Interrompi» il lavoro non resta appeso alla domanda."""
+    import threading
+
+    from PySide6.QtCore import QCoreApplication
+
+    from bookwriter.gui import main_window as mw
+
+    monkeypatch.setenv("BOOKWRITER_HOME", str(tmp_path))
+    win = mw.MainWindow()
+    viste: list[str] = []
+
+    def finestra(voce, *, later=True):
+        viste.append(voce["originale"])
+        assert threading.current_thread() is threading.main_thread()
+        return 1
+
+    monkeypatch.setattr(win, "_idiom_dialog", finestra)
+    risposte: list[object] = []
+    lavoro = threading.Thread(target=lambda: risposte.append(
+        win._decide_idiom({"originale": "in bocca al lupo", "opzioni": []})))
+    lavoro.start()
+    for _ in range(200):
+        QCoreApplication.processEvents()
+        if not lavoro.is_alive():
+            break
+        lavoro.join(0.02)
+    assert risposte == [1] and viste == ["in bocca al lupo"]
+    # «Non chiedere più»: la traduzione continua senza aprire altre finestre
+    win._idioms_silenced = True
+    assert win._decide_idiom({"originale": "x", "opzioni": []}) is None and len(viste) == 1
+    win._idioms_silenced = False
+    win._stop_requested = True
+    assert win._decide_idiom({"originale": "y", "opzioni": []}) is None
+    win.close()
+
+
+def test_the_structure_tab_lists_proposals_and_asks_a_waiver_for_blockers(
+        qapp, tmp_path, monkeypatch) -> None:
+    """La scheda della struttura mostra le proposte; una proposta con blocker si accetta solo
+    con una deroga scritta dall'autore."""
+    from types import SimpleNamespace
+
+    from bookwriter.gui import main_window as mw
+
+    monkeypatch.setenv("BOOKWRITER_HOME", str(tmp_path))
+    win = mw.MainWindow()
+    op = SimpleNamespace(id="S1-01", kind="reorder", status="proposta", issue="il 5 prima del 4",
+                         evidence="", reason="", risk="", breaks=[], blockers=["usa un nome"],
+                         warnings=[], unique_content=[], waiver="", destination=0,
+                         line=lambda: "Sposta il capitolo 5 dopo il 3")
+    decisioni: list[tuple] = []
+    finto = SimpleNamespace(
+        structure_data=lambda: SimpleNamespace(operations=lambda: [op], recheck=[4],
+                                               integrations=[], rounds=[1]),
+        structure_decide=lambda i, d, **kw: decisioni.append((i, d, kw)))
+    monkeypatch.setattr(win, "_structure_forge", lambda **kw: finto)
+    monkeypatch.setattr(win, "_quality_sources", lambda: [("Il libro", "nuovo")])
+    win._refresh_structure()
+    assert win.qs_table.topLevelItemCount() == 1 and "4" in win.qs_status.text()
+    win.qs_table.setCurrentItem(win.qs_table.topLevelItem(0))
+    assert "usa un nome" in win.qs_detail.toPlainText()
+    monkeypatch.setattr(mw.QInputDialog, "getMultiLineText",
+                        staticmethod(lambda *a, **k: ("", True)))
+    win._structure_decide("accept")
+    assert not decisioni, "senza motivo la deroga non vale"
+    monkeypatch.setattr(mw.QInputDialog, "getMultiLineText",
+                        staticmethod(lambda *a, **k: ("il flashback è voluto", True)))
+    win._structure_decide("accept")
+    assert decisioni == [("S1-01", "accept", {"waiver": "il flashback è voluto",
+                                              "destination": None})]
     win.close()

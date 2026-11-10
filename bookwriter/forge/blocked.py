@@ -279,6 +279,8 @@ def import_ricevute(research_dir: Path, min_chars: int = 400) -> list[dict[str, 
                 removed=dict(cleaned.removed),
                 chars_before=cleaned.chars_before,
                 chars_after=cleaned.chars_after,
+                author=cleaned.author,
+                published=cleaned.published,
             )
         else:
             page = Page(

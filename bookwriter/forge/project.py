@@ -45,8 +45,21 @@ PHASES: list[tuple[str, str]] = [
 PHASE_IDS = [p for p, _ in PHASES]
 
 
-def phase_title(phase: str) -> str:
-    return dict(PHASES).get(phase, phase)
+#: I lavori che la stessa macchina a fasi sa fare, con la cartella in cui vive ciascuno dentro il
+#: progetto: un libro da zero, il completamento di un manoscritto, il suo aggiornamento.
+MODES: dict[str, str] = {"nuovo": "book", "completa": "completa", "aggiorna": "aggiorna"}
+
+#: Come si chiamano le fasi quando il lavoro parte da un manoscritto.
+_MODE_TITLES: dict[str, dict[str, str]] = {
+    "completa": {"interview": "Manoscritto e intervista", "spec": "Piano del completamento",
+                 "writing": "Stesura delle parti nuove"},
+    "aggiorna": {"interview": "Manoscritto e intervista", "spec": "Piano delle modifiche",
+                 "writing": "Applica le modifiche"},
+}
+
+
+def phase_title(phase: str, mode: str = "nuovo") -> str:
+    return _MODE_TITLES.get(mode, {}).get(phase) or dict(PHASES).get(phase, phase)
 
 
 def _now() -> str:
@@ -65,6 +78,15 @@ class ForgeState:
     """
 
     phase: str = "interview"
+    #: che lavoro è: ``nuovo`` (scrivere da zero), ``completa`` (completare un manoscritto) o
+    #: ``aggiorna`` (cambiare un manoscritto: luoghi, epoche, eventi…). Vedi :data:`MODES`.
+    mode: str = "nuovo"
+    #: il manoscritto di partenza, per «completa» e «aggiorna»: ``{"file", "chapters", "words",
+    #: "imported"}``. I suoi capitoli originali restano intatti in ``originale/``.
+    manuscript: dict[str, Any] = field(default_factory=dict)
+    #: «Sorpresa»: l'autore ha dato solo una descrizione minima e ha lasciato decidere tutto il
+    #: resto. Il testo della descrizione, e a che passo è arrivato il lavoro automatico.
+    surprise: dict[str, Any] = field(default_factory=dict)
     #: la conversazione con l'autore: ``[{"role": "assistant"|"user", "text": ...}]``.
     transcript: list[dict[str, str]] = field(default_factory=list)
     #: il quaderno del libro: quello che è emerso dalla conversazione (vedi :mod:`notebook`).
@@ -86,6 +108,14 @@ class ForgeState:
     research_declined: bool = False
     #: l'autore ha lasciato la fase «Revisione» (discussa o saltata): non è mai un requisito.
     review_done: bool = False
+    #: le fasi che l'autore ha chiuso a mano senza che fossero finite («passa avanti lo
+    #: stesso»): valgono come chiuse per far partire da sola la fase dopo.
+    skipped: list[str] = field(default_factory=list)
+    #: la verifica della qualità: il tipo di libro scelto dall'autore (vuoto = dal quaderno)
+    quality: dict[str, Any] = field(default_factory=dict)
+    #: le deroghe dell'autore ai blocker di un piano: [{"chapter", "reason", "blockers",
+    #: "date", "trial"}] — registrate e recuperabili, mai implicite
+    waivers: list[dict[str, Any]] = field(default_factory=list)
     production_ready: bool = False
     built: list[str] = field(default_factory=list)
     #: cosa resta aperto alla consegna (ISBN, licenze dei caratteri, costola, quarta).
@@ -143,6 +173,30 @@ class BookProject:
     @property
     def out_dir(self) -> Path:
         return self.root / "output"
+
+    @property
+    def original_dir(self) -> Path:
+        """I capitoli del manoscritto di partenza, come sono arrivati: non si toccano mai."""
+        return self.root / "originale"
+
+    @property
+    def story_dir(self) -> Path:
+        """Il registro del racconto: continuità, cose già dette, motivi, piani delle scene."""
+        return self.root / "story"
+
+    @property
+    def plans_dir(self) -> Path:
+        return self.story_dir / "plans"
+
+    @property
+    def editorial_dir(self) -> Path:
+        """I resoconti della revisione editoriale, uno per capitolo."""
+        return self.out_dir / "editoriale"
+
+    @property
+    def trials_dir(self) -> Path:
+        """I capitoli riscritti in prova: fuori da ``chapters/``, non li compone nessuno."""
+        return self.out_dir / "prove"
 
     @property
     def spec_path(self) -> Path:

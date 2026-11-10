@@ -60,6 +60,10 @@ SECTIONS: list[tuple[str, str, str, str]] = [
     ("style_notes", "Precisazioni sullo stile", TEXT,
      "solo precisazioni o suggerimenti sullo stile scelto nell'interfaccia"),
     ("avoid", "Da evitare", LIST, "argomenti, toni, parole, soluzioni da non usare"),
+    ("changes", "Modifiche da fare", LIST,
+     "solo quando si aggiorna un libro già scritto: ogni cambiamento deciso con l'autore, "
+     "preciso (cosa diventa cosa: «l'evento all'Empire State Building si sposta sulla Torre di "
+     "Pisa»), una riga ciascuno"),
     ("agreed", "Deciso insieme", LIST,
      "le proposte discusse e accettate dall'autore, una per riga"),
     ("open_questions", "Ancora da decidere", LIST,
@@ -324,3 +328,24 @@ def brief(state: Any) -> str:
     if vecchie := legacy_answers(state):
         testo = (testo + "\n\n" if testo else "") + "## Dall'intervista precedente\n\n" + vecchie
     return testo or "(della conversazione con l'autore non è rimasto niente)"
+
+
+#: Le forme in cui il libro si racconta per scene: per queste la stesura progetta scene (chi vuole
+#: cosa, cosa lo ostacola, cosa cambia), non argomenti. Le altre (saggio, manuale…) argomentano.
+_NARRATIVE = re.compile(
+    r"romanz|giall|thriller|noir|fantasy|fantascien|horror|raccont|novel|novella|fiction|"
+    r"narrativ|avventur|fiaba|favol|saga|mystery|romance|story|stories", re.IGNORECASE)
+
+
+def is_narrative(state: Any) -> bool:
+    """Se il libro è un racconto (romanzo, giallo, racconti…) e non un saggio o un manuale."""
+    return bool(_NARRATIVE.search(get(state, "form")))
+
+
+def protagonist(state: Any) -> str:
+    """Il nome del protagonista: il personaggio che il quaderno dice tale, o il primo."""
+    persone = normalise(getattr(state, "notebook", None)).get("characters") or []
+    for p in persone:
+        if re.search(r"protagonist", str(p.get("role", "")), re.IGNORECASE):
+            return str(p.get("name", "")).strip()
+    return str(persone[0].get("name", "")).strip() if persone else ""

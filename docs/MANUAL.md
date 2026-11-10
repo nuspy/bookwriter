@@ -169,9 +169,24 @@ The three numbered tabs are the main path, in order.
 
 ## 3.1 Step 1 — Import texts
 
-Drag your files onto the list, or use **Add files…** / **Add folder…**. Supported formats: `txt`,
-`md`, `pdf`, `docx`, `epub`. Tick *Include subfolders* to walk a whole directory tree. Press
-**Import the selected texts**.
+Drag your files onto the list, or use **Add files…** / **Add folder…**. Tick *Include subfolders*
+to walk a whole directory tree. Press **Import the selected texts**.
+
+| Kind | Formats | How it is read |
+|---|---|---|
+| texts and documents | `txt`, `md`, `pdf`, `docx`, `epub` | text and layout |
+| scans and photos | `png`, `jpg`, `tif`, `webp`, `bmp`, scanned PDF pages | text recognition (OCR), offline; phone photos are straightened |
+| audio | `mp3`, `wav`, `m4a`, `ogg`, `flac` | transcribed in 10-minute pieces, cut at silences; each paragraph keeps its minute (`t=12:34`) |
+| mail | `eml`, `msg`, `mbox` | subject, sender, date and body; quoted replies and signatures are removed, text attachments are read |
+| web pages | `html`, `mhtml`, `url`, `webloc` | title, source address and main text; a `.url` shortcut gives only title and address |
+| spreadsheets | `csv`, `tsv`, `xlsx`, `xls`, `ods` | one paragraph per row (`Header: value`), one heading per sheet |
+
+A PDF mixing text pages and scanned pages is read page by page: OCR only where there is no text.
+**Transcribe audio on** chooses processor or graphics card. The graphics card is much faster, but
+it takes memory next to the loaded model. On first use the transcription model is downloaded
+(about 480 MB, once). On the processor, expect about real time: an hour of audio takes about an
+hour. Anything that could not be read in full (a page without text, a shortcut without its page)
+is listed under the result as a warning.
 
 The files are read and split into blocks of about 1,500 tokens. Their **structure** is recorded too
 — headings, chapters, page breaks, bold and italic — so that a book can later be handed back looking
@@ -184,7 +199,7 @@ waiting in the queue, in which case it is kept until its job is done (§4.4).
 
 ## 3.2 Step 2 — Prepare content
 
-Four buttons, to be used in this order.
+The buttons, to be used in this order (the two after *Connect the ideas* are optional).
 
 ### Split into sections
 
@@ -215,6 +230,27 @@ panel. Fast: a couple of minutes for a few hundred blocks.
 Computes the semantic index **of the sections** and builds the thematic network that links related
 ones. Required before grouping into chapters.
 
+### Merge duplicate ideas
+
+Notes written over months say the same thing more than once, in different words. This button
+finds candidate pairs by meaning and asks the model, ten pairs at a time, whether they are
+**the same idea** — «mentions X» and «X is true» are not. It also asks which version to keep and
+whether the other adds details. When they are the same idea, the two are merged:
+
+- the kept idea receives, word for word, any details the other adds;
+- themes, people and dates are joined;
+- an idea already placed in a chapter is never absorbed.
+
+Nothing is lost: **Merges done…** lists every merge with its reason and the full original text,
+and **Undo this merge** brings the absorbed idea back. Pairs already judged are not asked again.
+
+### Find logical links
+
+For neighbouring ideas the model says whether one is the **cause**, the **sequel**, an
+**example** or a **contradiction** of the other, with a reason and a confidence. The links are
+saved with their type and guide the ordering by purpose (§3.3). At the end, the ideas that
+contradict each other are shown, for you to decide which to keep or how to tell them together.
+
 ### Export browsable archive
 
 Produces an HTML archive with one page per section, the themes, and a graph of the connections.
@@ -237,6 +273,17 @@ Choose the ordering:
 | **in time order** | uses the dates found in the text; useless if your text has no dates |
 | **like a story** | asks the model for a narrative arc |
 | **by my own criterion** | you describe the criterion in plain words |
+| **from the purpose and the reader** | you write what the book is for and who it is for; the model designs parts and chapters, each with its goal and transition, then places every idea |
+
+With **from the purpose and the reader**, inside each chapter the logical links set the order
+(the cause before the effect, the idea before its example). Ideas the model could not place go to
+a chapter *Ideas to place*, and planned chapters left without material are listed: they are gaps
+in your notes. When the book is written in prose, each chapter's goal and transition go to the
+writer with the purpose and the reader.
+
+**Style of titles and transitions** applies a style profile (§4.1) to the reordering as well:
+chapter titles, and with the purpose ordering also goals and transitions, are written in that
+style. The style stays tied to the structure.
 
 **Set the number of chapters explicitly.** Left at 0 the program picks at most 10, which for a large
 corpus means chapters of twenty thousand words. For 400 sections, 20–25 chapters is a sensible
@@ -298,20 +345,43 @@ finished book costs hours.
 
 ## 4.1 Writing style
 
-A style profile describes writing along nine dimensions — syntax, punctuation, vocabulary, figures
-of speech, rhythm, register and so on — and is passed to the model whenever it writes.
+A style profile describes how a text is written, not what it says. It is stored as nine
+**dimensions** — syntax, punctuation, vocabulary, figures of speech, rhythm, voice, tone,
+cohesion, paragraph — each with a description in words, plus two or three example sentences and
+a list of constraints. The profile is passed to the model whenever it writes, rewrites or
+translates in that style.
 
 Four ways to create one:
 
-- **Learn from a text…** — point it at a document and it measures the style of that document. **To
-  keep your own voice, use one of your own texts here**: this is the single most effective setting
-  for fidelity.
-- **Describe in words…** — write what you want in plain language.
-- **Blend authors…** — one line per author, `Author:weight:dimension1,dimension2`, for example
-  `Calvino:0.7:syntax,rhythm`.
-- **Import from the library…** — reuse a profile saved in the global library, shared by all projects.
+- **Learn from a text…** — choose a document (TXT, Markdown, PDF, DOCX or EPUB) and the model
+  reads the style off it. It reads excerpts taken at regular intervals across the **whole**
+  document (about 40,000 characters), not just the first pages, which are often a preface or a
+  more careful opening. **To keep your own voice, use one of your own texts here**: this is the
+  single most effective setting for fidelity.
+- **Describe in words…** — write what you want in plain language, as freely as you like
+  («short, dry sentences; irony; no adjectives in the action scenes»). The model turns your
+  description into the nine dimensions.
+- **Blend authors…** — one line per author, in the form `Author:weight:dimensions`:
+  - the **weight** is a number from 0 to 1. The program turns the weights into percentages for
+    each dimension, so `0.7` and `0.3` become 70% and 30%;
+  - the **dimensions** are optional and limit what that author contributes. Without them, the
+    author contributes to all nine. Names can be in Italian or English (`sintassi` or `syntax`,
+    `ritmo` or `rhythm`); a name the program does not know is reported and ignored.
 
-Select a profile and paste some text in the box below to see what it does before committing to it.
+  Example:
+
+  ```
+  Calvino:0.7:syntax,rhythm
+  Hemingway:0.3:vocabulary
+  ```
+
+  Here Calvino sets syntax and rhythm, Hemingway the vocabulary, and the other dimensions take
+  both, 70/30.
+- **Import from the library…** — reuse a profile saved in the global library, shared by all
+  projects.
+
+Select a profile and paste some text in the box below to see what it does before committing to
+it.
 
 ## 4.2 Rewrite in another style
 
@@ -329,6 +399,14 @@ consistent from beginning to end.
 - **Format** — DOCX, PDF, Markdown or EPUB. See §5.1: the layout of the original is kept in the
   first three; an ebook has no pages to keep.
 - **Preview (first chapter)** runs on the first chapter only, so you can judge before committing.
+- **Form** — *Keep the form* returns the same paragraphs, one for one. *From verse to prose*
+  turns poetry into flowing prose. The chapters (cantos, sections) stay the same in number and
+  content; only the length and the style of the paragraphs change. Verses are sent in
+  tercets or stanzas, never cut in the middle. Since prose comes out longer than verse, the text
+  is split into units that fit within one answer of the model.
+- **Modernise the language** — today's grammar, syntax and vocabulary, keeping the author's
+  voice: images, metaphors, tone, the flavour of the vocabulary. Combined with *From verse to
+  prose* it gives, for example, the *Divine Comedy* in modern prose in Dante's style.
 
 The work is resumable within the session: if a run is interrupted, the blocks already rewritten are
 kept. Reopening the program clears working documents, and with them any unfinished run on those
@@ -343,6 +421,27 @@ Type the language in plain words (`English`, `en`, `inglese` all work), optional
 pick the output format, and use the preview first. This is deliberately sequential — that is what
 keeps the terminology consistent — so expect around twenty minutes for 25,000 words on a local model
 with style checking on.
+
+**Literary translation** (on by default) adds three things:
+
+- **Idioms and cultural references.** For each passage the model lists idioms, proverbs,
+  wordplay and culture-bound references, each with two to four ways of rendering it: an
+  equivalent in the target culture, literal, explained in the text, or the reference kept. With
+  **Ask me how to render idioms**, a window shows the expression, its sentence and the options:
+  choose one, write your own, or **Decide later**. The same expression is not asked twice in the
+  same book and language. A choice made in the preview holds for the whole book. Undecided
+  expressions get the translator's usual rendering. **Idioms to decide…** lets you decide them
+  afterwards; the passages that contain them are reopened and translated again when you resume.
+  **Include a translator's note among the options** adds that option to the list.
+- **The original's style.** If you choose no style, the style of the original is read from
+  excerpts across the whole book and guides the translation: voice, rhythm, register, sentence
+  length, imagery.
+- **Native-speaker polish.** After each passage, an editor who is a native speaker of the target
+  language fixes calques, false friends, unnatural syntax and rhythm, without changing meaning,
+  names or glossary terms. The polish is discarded, and the unpolished text kept, if it changes
+  the length by more than 15%, the headings, the paragraphs or a chosen rendering.
+
+In the queue (§4.4) nobody is there to answer, so idioms stay undecided there.
 
 Only the text is translated: headings, chapters, page breaks, blank pages and character formatting
 come back exactly as they were (§5.1). As in *Rewrite*, a book opened here is working material and
@@ -556,6 +655,179 @@ when one ends is not recoverable by anyone. That is also why picking up again re
 first missing *file*, not from where anyone believes they got to. The same row writes the front
 and back matter: introduction, preface, notice, glossary, author biography, acknowledgements.
 
+*A novel is written scene by scene.* For a narrative book (novel, crime, fantasy, stories…) each
+chapter goes through four steps:
+
+1. **Scene plan** (`book/story/plans/NN_name.json`). Each scene says where and when it happens,
+   who is in it, what the protagonist wants and what stands in the way, the clue, the decision
+   and its consequence, and how the danger moves on. It also says:
+   - **what changes**, as a concrete variable (knowledge, risk, possession, relationship,
+     destination, way out) with a before and an after. Two scenes that change the same thing in
+     the same way are one scene told twice;
+   - **the new question** that leads to the next scene;
+   - **the reasoning** behind a discovery: what the protagonist observes, how they read it, which
+     alternative they drop, why they act this way;
+   - **what each piece of research is for**: a puzzle, a decision, a balance of power, a seed for
+     later, or the setting. A detail with none of these stays in the research.
+
+   The plan also states the **bridge** from the previous chapter (clue → the protagonist's own
+   decision → the journey → the new goal) and what happens to the previous chapter's **open
+   threads**. A check reads the plan for timing, deadlines, doors, objects and the bridge before
+   any prose is written. A plan that fails is repaired.
+2. **Writing, one scene per call.** A scene longer than the model can write in one answer
+   (`writing.section_words`, default 1500) is split into parts, and each part has its own job.
+   A short scene is never asked to "develop further". It is asked only for what the plan
+   requires and the text does not yet show, and it may answer that nothing is missing. A chapter
+   that ends up short gets one or two scenes the story needs, never padding. Each scene receives
+   only the research assigned to it, with its purpose. It also receives **the facts already
+   fixed** by the scenes before: times, objects, doors, deadlines. A page taken in scene 1 is not
+   taken again in scene 4. The bibliography at the end of the chapter is built by the program
+   from the sources that were actually read.
+3. **Editorial review** (`book/output/editoriale/NN_name.md`). It runs in separate steps:
+   - **Measures:** where words pile up and which paragraphs look alike.
+   - **Meaning, across the whole chapter:**
+     - an idea already stated is said again without anything new;
+     - a comment re-explains a scene the reader has just seen;
+     - a metaphor is applied to everything;
+     - a pile of details does nothing for the action.
+
+     These are cut or rewritten paragraph by paragraph. The space goes to the investigation,
+     the links and the consequences.
+   - **Repetition inside each scene.**
+   - **Event timeline** (`book/story/timeline/NN_name.json`): who is where, at what time, with
+     which objects, behind which doors. Rules catch:
+     - a time that goes backwards;
+     - a move or an escape that is never shown;
+     - the same object taken twice;
+     - a deadline with two times;
+     - a date that does not match the season.
+
+     A model reads each scene against what came before, and the whole chapter checks the
+     previous chapter's open threads and events that belong to later chapters. Serious problems
+     are fixed in the scenes involved, and the timeline is rebuilt on the final text: what is
+     left marks the chapter *to review*.
+   - **Sources:** the figures and quotations that do not come from the research, and where each
+     claim used comes from (type, support, independent lines of sources).
+   - **Quality grid:** three separate checks (story, investigation, style), each item passing or
+     failing with a quotation as evidence.
+
+   No step may shorten the chapter by more than a tenth. The checks can run on a different model
+   from the one that writes (`llm.models.review`). A judgement by the model that wrote the
+   chapter is not an independent check.
+**The methodology of each text.** Before a chapter is planned and before it is revised, the
+model reads the text and decides how to check it:
+
+- which criteria matter and how much;
+- which **registers** to keep: the things this text makes important, such as the cards of an
+  archive index, the nodes of a network or the copies of a document;
+- for each register, the **invariants** the program will verify: every distribution adds up to
+  the canonical total, counts follow the events, an item is in one place at a time;
+- the motifs to audit, the specific risks, the acceptance tests, and the questions only you can
+  answer.
+
+The program validates the proposal: a sum is checked only for categories declared disjoint and
+exhaustive, with a known total. The methodology is saved with a version number in
+`book/story/metodologia/`. Your explicit rules (requirements, exclusions, constraints, canon)
+are kept in `book/story/profilo_progetto.json`, extracted once and then reused.
+
+The model then reads the numbers and states of each register, scene by scene, with the quoted
+sentence as evidence, and `unknown` or `ambiguous` when it cannot tell. The program checks the
+invariants. A count that does not add up (nine + five + two nodes out of fourteen) is a
+**blocker**. The writer receives the registers as constraints: totals, categories, initial
+states.
+
+**Plan gate.** Every defect of a plan has a severity: blocker, major, minor or preference.
+
+- **How repairs are judged:** a repaired plan is kept only if it lowers the residual risk,
+  blockers first, then majors, then minors. The number of defects does not decide.
+- **Research IDs:** a mangled research ID is resolved only when the chapter's register has one
+  close candidate. The resolution is recorded in the plan; ambiguous IDs are reported.
+- **Blockers left after repair:** the chapter is **not written**. A dialog lists the blockers
+  and offers three choices:
+  - **Repair only the defects** (the default): only the scenes the defects name are redone,
+    with the bridge and the open threads if needed. Sound scenes stay as they were, and writing
+    resumes from the repaired plan.
+  - **Replan from scratch**: a new plan, which may bring new defects.
+  - **Proceed with a waiver…**: asks for a reason, which stays recorded in the plan and in the
+    book's state.
+
+  The same dialog appears for a chapter rewritten as a trial.
+- **Blockers found by a model are verified.** The plan's continuity check, and a register
+  saying something is «in two places at once», are judgements of a model. A model finds a
+  «blocker» in almost any plan, so these defects stay blocking only if an independent check
+  confirms them. It must quote, word for word, the two passages of the plan that contradict each
+  other, and the program checks the quotes are really there. Otherwise the defect becomes major:
+  it is not dropped, and the repair still works on it. Examples that are not blockers: a
+  dramatic judgement (a goal too hard to reach) or a metaphor taken literally. The program's own
+  checks are not verified: the protagonist, the bridge, the counts that do not add up.
+- **The protagonist:** a novel's present without the protagonist in any scene, or without a
+  decision of theirs, is a blocker. Missing from only some scenes is a major defect.
+- **Two places are the same** only when they share a proper name (Lyon, Dendera). Common words
+  such as «conservation office» do not count, so a jump between countries asks for its bridge.
+- **Fallback plan:** if the model returns no plan at all, the plan built from the key points
+  counts as a blocker too.
+
+4. **Continuity ledger** (`book/story/ledger.md`). It records where the chapter leaves the
+   protagonist, what the reader already knows, the motifs and their function, and the names,
+   codes and offices the story has invented. The next chapter starts from here.
+
+### Quality and revision
+
+The **Quality** tab scores a chapter (**One chapter**) or the whole book (**The whole book**) from
+0 to 10 per criterion, with evidence and problems. The yardstick depends on the type of book
+(novel, short stories, memoir, popular non-fiction, essay, manual, academic) and on its purpose.
+For a novel the eleven criteria of the editorial rubric carry their weights: causality 15%,
+chronology and geography 12%, continuity 12%, objects and documents 10%, scene function 10%,
+suspense and consequences 10%, adventure density 8%, repetition 7%, voice and readability 6%,
+length 5%, sources 5%. The other criteria are shown with a small weight. A critical criterion
+below its threshold keeps the chapter from being accepted, whatever the average says.
+
+**Improve up to quality** works in rounds. For a novel each round is a full revision:
+
+1. **Baseline:** an untouched copy, words per scene, the event timeline and the object registry.
+   It also records which of the app's **original** chapters were consulted, with their version.
+   Anything the app does not have stays `UNVERIFIED`.
+2. **Diagnosis:** issues with a stable ID (`CH11-TIME-001`) and a severity (Blocker, Major,
+   Moderate, Minor). Each issue has evidence in the text, reader impact, an acceptance test and a
+   basis (text, canon, evidence, inference, open question).
+3. **Plan:** interventions in dependency order (chronology, continuity, objects, scene function,
+   repetition, prose, length). Each one is an operation (rewrite, merge, split, insert, move,
+   trim, preserve, author decision) on a defined target. The plan also lists what to preserve and
+   the questions for the author.
+4. **Interventions:** one at a time, on its target only. The timeline is rebuilt after the
+   structural blocks.
+5. **Independent verification:** each issue gets a status (resolved, partially resolved,
+   unresolved, regression, not applicable), backed by a quotation. The step also looks for new
+   regressions and checks that the preserved items are still there.
+6. **Gates A–I and verdict:** PASS, PASS WITH WARNINGS, REVISE, AUTHOR INPUT REQUIRED or FAIL.
+   No average makes up for a gate.
+
+Each round is saved in `revisioni/<run>/`:
+
+- the baseline;
+- the revised text;
+- a twelve-section report;
+- the diff;
+- `run.json`.
+
+The revised text replaces the chapter only if the verdict is not FAIL and the rubric did not get
+worse. Every version stays in `story/versions/` and **Back to the previous version** restores it.
+After the automatic rounds (`quality.max_rounds` in Settings), each further round asks you first.
+From the command line: `bookwriter forge revise --chapter 11 [--file draft.md --out revised.md]`.
+
+**Rewrite as a trial** rewrites one chapter with this pipeline into `book/output/prove/` and
+leaves `chapters/` untouched. **Rebuild the ledger** extracts the ledger from chapters that are
+already written. **Open the editorial reports** shows the reviews. From the command line:
+`bookwriter forge write --chapter 11 --trial`, `forge ledger`, `forge claims`,
+`forge editorial --chapter 11`, `forge benchmark --chapter 11`.
+
+The research is reorganised in `book/research/claims.json`:
+
+- each claim appears once, and two copies of the same page count as one source;
+- a source the model cited without ever reading it is marked *not verified* and never goes into
+  a bibliography;
+- a decision you made about a contrast in one chapter is not asked again in another.
+
 A chapter the model fails on does not take the others down with it: the run carries on and the
 report names it at the end, with the reason, under **NON RIUSCITI**. Nothing was written for it,
 so pressing the button again simply picks it up along with whatever else is missing. Three
@@ -608,36 +880,106 @@ kept. Imported documents, the project database and everything outside `book/` ar
 The same three actions exist at the command line: `forge save`, `forge saves`, `forge restore`,
 and `forge reset` (which puts the book aside unless you pass `--delete`).
 
-## 4.7 Complete the content
+### Book structure
 
-The assistant analyses what the book is missing and proposes questions. You answer in your own
-words, press **Add the answer to the book**, and your answer becomes new material, ready to be
-organized and written like everything else.
+The third sub-tab of **Quality** works on the book as a whole: the order and the number of its
+chapters.
+
+**Analyse the structure** proposes four kinds of operation:
+
+- **move** a chapter, with the causal or chronological reason;
+- **cut** a chapter whose function is duplicated, saying where its unique content goes;
+- **merge** two chapters;
+- **split** one at a section heading.
+
+The model never reads the chapters' text, only their records: purpose, summary from the ledger,
+what the reader already knows, who knows what, events, motifs, names introduced, open threads,
+length and score.
+
+Each proposal comes with the problem it solves, the evidence, the risk and the links it breaks.
+The program then checks it:
+
+- **blocker:** a move that puts a chapter using a name before the chapter that introduces it;
+- **blocker:** a cut whose unique content has no destination;
+- **warning:** an inversion of explicit dates, since a flashback may be intended.
+
+Nothing happens without you, one proposal at a time:
+
+- **Accept…** — a proposal with blockers is accepted only with a written waiver, which stays
+  recorded. For a cut, you are asked which chapter receives the unique content. A rejected
+  proposal is not proposed again.
+- **Apply** — first every file to be touched is copied to `story/struttura/<run>/`. Then:
+  - the outline changes, and the chapter files are renumbered along with their research, plans,
+    timelines and quality history;
+  - a merge asks the model only for the joint between the two chapters;
+  - the chapters moved, merged or split are marked for a recheck.
+- **Integrate the cut content** writes the cut chapter's unique content into the chapter that
+  receives it, keeping its existing text word for word.
+- **Recheck the marked chapters** redoes their ledger records and their quality scores.
+- **Undo the last application** puts every file back from the copy. If a file changed after the
+  application, you are asked before discarding those changes.
+
+The proposals, decisions and applications are in `story/struttura_review.json`. The book's
+overall score (`quality/libro.json`) is not updated by itself: analyse the book again.
+
+## 4.7 Complete a book
+
+For a manuscript that is unfinished: chapters missing, parts only sketched. Two sub-tabs:
+
+- **Complete (in phases)** — the same phases as *Write from scratch*, starting from your
+  manuscript. You load it, the assistant reads it and asks what is missing. Then come the plan
+  of the completion and the research. Only the **new parts** are written, in the book's voice
+  and continuing from where the existing chapters leave off. Existing chapters stay as they
+  are.
+- **Gaps in the notes** — for projects made from your own notes (Part 3). The assistant looks
+  for what the material does not cover and asks you questions. You answer in your own words and
+  press **Add the answer to the book**; the answer becomes new material, ready to be organised
+  and written like everything else.
 
 ## 4.8 Update a book
 
-For when you already have a draft and new material has arrived.
+Two different jobs, in two sub-tabs.
 
-Load the draft with **Load the draft…**, then press **Compare and update**. The program reads the
-draft's structure, compares every paragraph against every section of the project by meaning, and
-produces the whole book again with four kinds of change marked:
+**Update (in phases)** — a change decided with you, followed through the whole book. You load
+the manuscript and say what changes («the meeting at the Empire State Building moves to the
+Tower of Pisa»). The assistant asks about the consequences, then:
+
+1. it builds the **profile of the differences**: every category in which the old and the new
+   differ (travel, places, language, money, customs, climate and season, food, laws, people
+   met, atmosphere), each with the question to research;
+2. it reads **every chapter**, paragraph by paragraph, and marks those the change affects,
+   including indirect effects that no keyword finds (a season, a journey, a habit);
+3. it researches what is needed and rewrites **only the affected paragraphs**, in the book's
+   voice. Everything else stays word for word;
+4. a second pass looks for references to the old version that are still there. **Change
+   document** then produces the updated book with every change marked, chapter by chapter, with
+   the reason.
+
+Your original stays intact in `originale/`; the plan of the changes is in
+`story/impact.json`.
+
+**Merge from notes** — for when you already have a draft and new material has arrived in
+the project's notes. Load the draft with **Load the draft…** and press **Compare and update**.
+The program splits the draft into chapters and paragraphs and compares them **by meaning**
+(embeddings, not shared words) with the sections of the project. The result is the whole book
+with four kinds of change marked:
 
 | Mark | Meaning |
 |---|---|
 | framed in red | new content, present in the project but missing from the draft |
-| struck through in red | a paragraph that repeats something already said elsewhere |
+| struck through in red | a paragraph that repeats something already said elsewhere in the draft |
 | struck red then green | a paragraph that was incomplete, merged with the fuller material |
 | plain | unchanged |
 
-Material that does not belong to any existing chapter is collected in a chapter named *New content
-to place*.
+Material that does not belong to any existing chapter is collected in a chapter named *New
+content to place*.
 
 Two files are written: the book in the **format you chose** — DOCX (colours, strikethrough and
 frames are real Word formatting), PDF or Markdown, all three carrying the same marks — and an
 **HTML** version, for reading quickly in a browser.
 
-**Merge incomplete passages** can be turned off: the partial content is then appended separately
-instead of being merged, and no model call is made.
+**Merge incomplete passages** can be turned off: the partial content is then appended
+separately instead of being merged, and no model call is made.
 
 ## 4.9 Project summary
 
@@ -798,12 +1140,16 @@ them. The settings worth knowing:
 | `llm.models.reasoning` | the model that writes |
 | `llm.models.embedding` | the model that compares meanings |
 | `llm.models.heavy` | optional model for quality passes |
+| `quality.min_global` · `quality.min_critical` · `quality.max_rounds` | when a chapter is accepted (default 7 and 6 out of 10) and how many correction rounds run by themselves (default 3) |
+| `llm.models.review` | optional model for the writing checks (plan continuity, event timeline, meaning, quality grid); empty = the model that writes. The app never loads it: it asks the server, like the others |
 | `llm.request_timeout_s` | seconds before a request is given up (default 900) |
 | `llm.concurrency` | parallel requests for indexing and section labelling (default 4) |
 | `research.min_page_chars` | how much prose must remain after cleaning a web page for it to count as readable (default 400); below, it is recorded as *unreadable* and never sent to the model |
 | `research.min_relevance` | threshold (0–1, default 0.25) of the model's judgement of whether a page serves the point; below, the page is recorded as *not relevant*; 0 = no filter |
 | `research.excluded_domains` | domains nothing is downloaded from (default YouTube and `amazon.*`, every country); results are recorded as *excluded* |
 | `llm.temperature`, `llm.top_p`, `llm.top_k`, `llm.min_p`, `llm.presence_penalty`, `llm.repetition_penalty` | sampling. Unset (default) = not sent: the model server decides. When set, the value applies to every request. A zero temperature asked for by the program is no longer sent; write `temperature = 0` if you really want greedy decoding |
+| `llm.reasoning_effort_writing` | how much the model reasons while writing the book (scene plan, drafting, editorial review, ledger): `same` (default, the general level) or a level of its own |
+| `writing.section_words` | the most words asked for in one call (a scene longer than this is written in parts): set it to what your model writes in one answer |
 | `chunking.target_tokens` | size of the text blocks (default 1500) |
 | `project.language` | language of generated content |
 | `ui.language` | language of the interface |

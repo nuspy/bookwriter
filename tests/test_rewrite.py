@@ -499,10 +499,12 @@ def test_resuming_the_same_language_still_picks_up_where_it_left(tmp_path: Path)
             return super().chat_json(messages, schema=schema, model=model)
 
     cliente = Contatore()
+    # Si contano le sole chiamate di traduzione: i passaggi letterari (stile, modi di dire,
+    # rifinitura) hanno i loro test in test_translation_literary.py.
     primo = rewrite_document(db, doc_id, "C", cliente, mode="translate", target_language="inglese",
-                             critic=False, should_stop=lambda: fatti["n"] >= 1)
+                             critic=False, literary=False, should_stop=lambda: fatti["n"] >= 1)
     secondo = rewrite_document(db, doc_id, "C", cliente, mode="translate",
-                               target_language="inglese", critic=False)
+                               target_language="inglese", critic=False, literary=False)
 
     assert secondo.run_id == primo.run_id, "stessa lingua, stessa lavorazione ripresa"
     assert fatti["n"] == 3, "i due mancanti, non tutti e tre da capo"

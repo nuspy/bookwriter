@@ -764,10 +764,20 @@ def test_the_landscape_reaches_the_writing_as_material(tmp_path: Path, web) -> N
     f = _ricercato(tmp_path, client=modello)
     capitolo = f.state.outline[0]
     assert "Opere simili da cui attingere" in f._research_for(capitolo)
+    piani: list[str] = []
+    originale = modello.chat_json
+
+    def guarda(messages, *, schema, **kw):
+        if "dramatic_question" in schema.get("properties", {}):
+            piani.append(messages[-1]["content"])
+        return originale(messages, schema=schema, **kw)
+
+    modello.chat_json = guarda
     f.write_next()
-    assert any("Un libro che c'è" in testo for testo in modello.scritti)
-    assert any("Materiale trovato dalla ricerca per questo capitolo (da usare)" in testo
-               for testo in modello.scritti)
+    # in un racconto le opere simili servono al piano delle scene; il materiale del capitolo
+    # arriva alla scena a cui è assegnato
+    assert any("Un libro che c'è" in testo for testo in piani)
+    assert any("Il materiale di ricerca per QUESTA scena" in testo for testo in modello.scritti)
 
 
 def test_the_unapproached_questions_message_does_not_blame_the_web(tmp_path: Path, web) -> None:

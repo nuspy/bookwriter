@@ -16,7 +16,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from bookwriter.forge import editor as ed
 from bookwriter.forge import interview as iv
+from bookwriter.forge import writing as wr
 from bookwriter.forge import notebook as nb
 from bookwriter.forge import spec as sp
 from bookwriter.forge.project import slugify
@@ -93,6 +95,11 @@ class Facts:
     research_old_format: bool = False
     #: dove riprenderebbe la ricerca: ``(numero del capitolo, punto, punti del capitolo)``, o None
     research_next: tuple | None = None
+    #: il lavoro (``nuovo``, ``completa``, ``aggiorna``) e se il manoscritto è caricato
+    mode: str = "nuovo"
+    manuscript_loaded: bool = False
+    #: capitoli che la revisione editoriale ha lasciato da riguardare (voci critiche aperte)
+    to_review: int = 0
 
 
 def _review_points(forge) -> list:
@@ -125,7 +132,8 @@ def read_facts(forge) -> Facts:
         chapters_sourced=fonti,
         research_done=s.research_done,
         research_declined=s.research_declined,
-        written=len(st.written),
+        written=(previsti - len(wr.pending_chapters(forge.project, s))
+                 if getattr(forge, "from_manuscript", False) else len(st.written)),
         planned=previsti,
         config_exists=p.config_path.exists(),
         cover=bool(st.cover),
@@ -142,6 +150,9 @@ def read_facts(forge) -> Facts:
         short_chapters=tuple((n, w, b) for n, w, b in forge.short_chapters()),
         research_old_format=forge.research_format_old(),
         research_next=prossimo,
+        mode=getattr(s, "mode", "nuovo") or "nuovo",
+        manuscript_loaded=bool((getattr(s, "manuscript", None) or {}).get("imported")),
+        to_review=len(ed.review_flags(p)),
     )
 
 
@@ -206,6 +217,18 @@ def command_states(forge, facts: Facts | None = None) -> dict[str, Command]:
     stati["writing.redo_short"] = (
         consigliato_se(True) if f.short_chapters else
         Command(SUPERATO, t("Nessun capitolo è molto sotto il suo budget di parole.")))
+    stati["interview.surprise"] = (
+        Command(SUPERATO, t("Il libro è già fatto.")) if f.built else Command(DISPONIBILE))
+    stati["interview.manuscript"] = (
+        Command(SUPERATO, t("Il manoscritto è già caricato.")) if f.manuscript_loaded
+        else Command(CONSIGLIATO))
+    stati["writing.update_doc"] = (Command(DISPONIBILE) if f.mode == "aggiorna" and f.written
+                                   else Command(SUPERATO, t("Prima applica le modifiche.")))
+    nessuno = Command(SUPERATO, t("Prima scrivi almeno un capitolo."))
+    stati["writing.trial"] = Command(DISPONIBILE) if f.written else nessuno
+    stati["writing.ledger"] = Command(DISPONIBILE) if f.written else nessuno
+    stati["writing.reports"] = (Command(CONSIGLIATO) if f.to_review else
+                                Command(DISPONIBILE) if f.written else nessuno)
 
     # --- produzione
     stati["production.cover"] = consigliato_se(not f.cover)
@@ -251,6 +274,9 @@ def next_step(forge, *, web_on: bool, activity_kind: str = "", facts: Facts | No
         return t("Aspetta che finisca: non serve premere altro.")
 
     if f.phase == "interview":
+        if f.mode != "nuovo" and not f.manuscript_loaded:
+            return t("Comincia dal manoscritto: premi “Carica il manoscritto…” e scegli il "
+                     "file del libro.")
         if f.interview_closed:
             return t("Conversazione chiusa: premi “Passa alla specifica”.")
         if not f.exchanges:
@@ -382,7 +408,8 @@ def command_qss(state: str, dark: bool) -> str:
     peso = "bold" if state == CONSIGLIATO else "normal"
     corsivo = "italic" if state == SUPERATO else "normal"
     corpo = (f"background:{sfondo};color:{testo};border:{spessore}px solid {bordo};"
-             f"border-radius:6px;padding:6px 12px;font-weight:{peso};font-style:{corsivo}")
+             f"border-radius:10px;padding:6px 12px;min-height:30px;font-weight:{peso};"
+             f"font-style:{corsivo}")
     return (f"QPushButton,QPushButton:disabled{{{corpo}}}"
             f"QPushButton:focus{{border:3px solid {FOCUS[tema]}}}")
 

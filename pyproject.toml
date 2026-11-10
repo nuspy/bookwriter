@@ -38,13 +38,32 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Loader per formati aggiuntivi; importati in modo lazy.
-ingest = ["ebooklib>=0.18"]
+# Loader per formati aggiuntivi; importati in modo lazy. OCR di immagini e PDF scansionati
+# (rapidocr porta con sé i modelli: funziona offline), posta di Outlook, fogli Excel.
+ingest = [
+    "ebooklib>=0.18",
+    "rapidocr>=3.10",
+    "onnxruntime>=1.17",
+    "extract-msg>=0.48",
+    "openpyxl>=3.1",
+    "xlrd>=2.0",
+]
+# Trascrizione dei file audio (Whisper in locale); il modello si scarica al primo uso.
+audio = ["faster-whisper>=1.0"]
 # Interfaccia grafica desktop.
 gui = ["pyside6>=6.6"]
 dev = ["pytest>=8.0", "pytest-httpx>=0.30", "ruff>=0.4"]
-# Installazione completa (runtime): loader + GUI.
-all = ["ebooklib>=0.18", "pyside6>=6.6"]
+# Installazione completa (runtime): loader + audio + GUI.
+all = [
+    "ebooklib>=0.18",
+    "rapidocr>=3.10",
+    "onnxruntime>=1.17",
+    "extract-msg>=0.48",
+    "openpyxl>=3.1",
+    "xlrd>=2.0",
+    "faster-whisper>=1.0",
+    "pyside6>=6.6",
+]
 
 [project.scripts]
 bookwriter = "bookwriter.cli:app"

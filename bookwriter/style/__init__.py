@@ -6,6 +6,8 @@ from bookwriter.style.engine import (
     authors_style,
     blend_styles,
     build_style_contract,
+    campione_rappresentativo,
+    extract_source_style,
     extract_style,
 )
 from bookwriter.style.models import STYLE_DIMENSIONS, STYLE_SCHEMA, StyleProfile
@@ -19,5 +21,7 @@ __all__ = [
     "authors_style",
     "blend_styles",
     "build_style_contract",
+    "campione_rappresentativo",
+    "extract_source_style",
     "extract_style",
 ]

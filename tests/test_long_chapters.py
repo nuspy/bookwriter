@@ -119,7 +119,8 @@ class ModelloCorto(FintoModello):
             return super().chat(messages, **kw)
         indice = int(re.search(r"Sezione (\d+) di \d+", sistema).group(1))
         voluto = int(re.search(r"Circa (\d+) parole", sistema).group(1))
-        continuazione = messages[-1]["content"].startswith("Prosegui ESATTAMENTE")
+        # una continuazione rimanda il testo già scritto come risposta dell'assistente
+        continuazione = len(messages) > 2 and messages[-2]["role"] == "assistant"
         self.sezioni.append((indice, continuazione))
         self.prompt_sezioni.append(messages[1]["content"])
         n = min(self.tetto, voluto)
@@ -136,6 +137,8 @@ def _forge_lungo(tmp_path: Path, *, tetto: int, budget: int = 7000, sezione: int
     f = Forge(tmp_path / "book", cfg, client=ModelloCorto(tetto, chapters=capitoli, words=900))
     f.start()
     _pronto_a_scrivere(f)
+    # il percorso a sezioni è quello dei libri che argomentano: un racconto si scrive per scene
+    f.state.notebook["form"] = "saggio divulgativo"
     for c in f.state.outline:
         c["words"] = budget
     return f

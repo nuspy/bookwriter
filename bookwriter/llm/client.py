@@ -161,6 +161,43 @@ def quick(client):
     return client.quick() if isinstance(client, LMStudioClient) else client
 
 
+class _Stesura:
+    """Il client visto dalla stesura: ogni ``chat`` e ``chat_json`` porta ``writing=True``."""
+
+    def __init__(self, client: LMStudioClient) -> None:
+        self._client = client
+
+    def chat(self, messages, **kw):
+        return self._client.chat(messages, writing=True, **kw)
+
+    def chat_json(self, messages, **kw):
+        return self._client.chat_json(messages, writing=True, **kw)
+
+    def __getattr__(self, nome: str):
+        return getattr(self._client, nome)
+
+
+def relax_enums(schema: Any) -> Any:
+    """Lo schema senza liste chiuse: ``{"type": "string", "enum": [...]}`` diventa una stringa
+    con i valori ammessi nella descrizione. Il resto resta com'è."""
+    if isinstance(schema, list):
+        return [relax_enums(x) for x in schema]
+    if not isinstance(schema, dict):
+        return schema
+    fuori = {k: relax_enums(v) for k, v in schema.items() if k != "enum"}
+    if "enum" in schema:
+        valori = ", ".join(str(v) for v in schema["enum"])
+        descrizione = str(schema.get("description") or "").strip()
+        fuori["description"] = (descrizione + " " if descrizione else "") + f"Uno fra: {valori}."
+    return fuori
+
+
+def writing(client):
+    """``client`` per la stesura (livello ``reasoning_effort_writing``), se è il client vero;
+    ogni altro (i finti dei test) com'è."""
+    return _Stesura(client) if isinstance(client, LMStudioClient) else client
+
+
 @dataclass
 class Destinazione:
     """Dove mandare la richiesta e con quale nome chiamare il modello."""
@@ -829,9 +866,10 @@ class LMStudioClient:
         extra: dict[str, Any] | None = None,
         on_delta: Callable[[str, str], None] | None = None,
         quick: bool = False,
+        writing: bool = False,
     ) -> str:
-        """Un completamento testuale. ``quick``: è un compito rapido (vedi
-        :meth:`LLMConfig.reasoning_for`), che ragiona al livello scelto per quelli."""
+        """Un completamento testuale. ``quick``: è un compito rapido; ``writing``: è un compito
+        della stesura (vedi :meth:`LLMConfig.reasoning_for`): ragionano al livello scelto per loro."""
         dove = self.resolve_target(model)
         model_id = dove.model
         # Nessun tetto ai token generati: quanto può produrre un modello lo decide chi governa
@@ -849,7 +887,7 @@ class LMStudioClient:
         # del fornitore — ``reasoning_effort`` per OpenAI e compatibili, un'altra forma per NVIDIA
         # o Anthropic — passando da llmswitch, il punto unico in cui un livello diventa parametri.
         richiesto = body.pop("reasoning_effort", None)
-        livello = _reasoning.resolve(self.config.reasoning_for(quick) or _reasoning.INHERIT,
+        livello = _reasoning.resolve(self.config.reasoning_for(quick, writing) or _reasoning.INHERIT,
                                      richiesto or _reasoning.INHERIT)
         body = _reasoning.params_for(livello, self._reasoning_dialect(), body)
         data = self._chat_request(body, dove.base_url, on_delta)
@@ -891,6 +929,7 @@ class LMStudioClient:
         reasoning_effort: str = "",
         on_delta: Callable[[str, str], None] | None = None,
         quick: bool = False,
+        writing: bool = False,
     ) -> Any:
         """Una risposta JSON conforme a ``schema``: il formato si dichiara, e si controlla qui.
 
@@ -914,6 +953,12 @@ class LMStudioClient:
         Nessun tetto ai token: né qui né sul ragionamento.
         """
         modo = self.config.structured_mode()
+        # Le liste chiuse di valori (``enum``) non vanno al server: alcuni (Basalt) controllano
+        # lo schema dopo la generazione e rifiutano l'intera risposta per un solo valore fuori
+        # lista — nella prova v4 del cap. 11 il piano delle scene è andato perso così, dopo nove
+        # generazioni. I valori ammessi restano scritti nella descrizione del campo; chi chiama
+        # normalizza o scarta un valore fuori lista, e perde un campo, non la risposta.
+        schema = relax_enums(schema)
         extra: dict[str, Any] = {}
         if reasoning_effort:
             extra["reasoning_effort"] = reasoning_effort
@@ -925,7 +970,7 @@ class LMStudioClient:
             extra["response_format"] = {"type": "json_object"}
         completo = self._with_schema(messages, schema, in_prompt=modo != "json_schema")
         testo = self.chat(completo, model=model, extra=extra or None,
-                          on_delta=on_delta, quick=quick)
+                          on_delta=on_delta, quick=quick, writing=writing)
         tagliata = self.last_finish_reason == "length"
         dati, errore, dettaglio = self._check_json(testo, schema)
         if errore is None:
@@ -947,7 +992,7 @@ class LMStudioClient:
                     "Correggi SOLO questo, lascia invariato tutto il resto, e rispondi con "
                     "l'INTERO oggetto JSON corretto: solo il JSON, senza testo attorno.")},
             ]
-            testo = self.chat(riparazione, model=model, extra=extra or None, on_delta=on_delta, quick=quick)
+            testo = self.chat(riparazione, model=model, extra=extra or None, on_delta=on_delta, quick=quick, writing=writing)
             dati, errore, _ = self._check_json(testo, schema)
             if errore is None:
                 return dati
@@ -961,7 +1006,7 @@ class LMStudioClient:
                 "ripetere la stessa frase.")},
         ]
         testo = self.chat(riparazione, model=model,
-                          extra=extra or None, on_delta=on_delta, quick=quick)
+                          extra=extra or None, on_delta=on_delta, quick=quick, writing=writing)
         dati, errore, _ = self._check_json(testo, schema)
         if errore is None:
             return dati

@@ -2,6 +2,10 @@
 
 Caratteristiche: scansione ricorsiva, filtri include/exclude, **dedup per sha256** (re-ingestione
 idempotente/incrementale), linking prev/next dei chunk, riepilogo con importati/saltati/falliti.
+
+I formati lenti (OCR delle scansioni, trascrizione dell'audio) riferiscono l'avanzamento dentro
+il file allo stesso ``progress`` della pipeline, con la nota accanto al nome del file; quel che
+un loader ha letto solo in parte finisce fra gli ``avvisi`` del riepilogo.
 """
 
 from __future__ import annotations
@@ -26,12 +30,16 @@ class IngestReport:
     skipped: list[str] = field(default_factory=list)  # duplicati (già presenti)
     failed: list[tuple[str, str]] = field(default_factory=list)
     chunks: int = 0
+    #: (file, avviso): importati, ma non del tutto (pagine scansionate senza OCR, collegamenti
+    #: non scaricati, messaggi illeggibili di una casella)
+    warnings: list[tuple[str, str]] = field(default_factory=list)
 
     def summary(self) -> str:
-        return (
+        riga = (
             f"importati={len(self.imported)} · saltati(dup)={len(self.skipped)} · "
             f"falliti={len(self.failed)} · chunk={self.chunks}"
         )
+        return riga + (f" · avvisi={len(self.warnings)}" if self.warnings else "")
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -88,11 +96,17 @@ def ingest_paths(
     exclude: list[str] | None = None,
     transient: bool = False,
     progress=None,
+    dispositivo_audio: str | None = None,
+    scarica_pagina=None,
 ) -> IngestReport:
     """Importa i documenti dai path indicati. ``progress`` è un callback opzionale ``(done, total, name)``.
 
     Con ``transient=True`` i documenti entrano come materiale di lavoro: restano usabili per
     tutta la sessione ma non fanno parte delle fonti del progetto e spariscono alla riapertura.
+
+    Durante un file lungo (OCR, trascrizione) ``progress`` riceve ``(done, total, "nome — nota")``
+    con ``done`` fermo sul file in corso. ``dispositivo_audio`` e ``scarica_pagina`` passano al
+    loader (vedi :func:`~bookwriter.ingest.loaders.load_document`).
     """
     files = iter_files(paths, recursive=recursive, include=include, exclude=exclude)
     report = IngestReport()
@@ -118,7 +132,13 @@ def ingest_paths(
                                 ses.add(row)
                         ses.commit()
                     continue
-                doc = load_document(path)
+                avanzamento = None
+                if progress:
+                    def avanzamento(_fatto, _totale, nota, _i=idx, _nome=path.name):
+                        progress(_i, len(files), f"{_nome} — {nota}")
+                doc = load_document(path, progress=avanzamento,
+                                    dispositivo_audio=dispositivo_audio,
+                                    scarica_pagina=scarica_pagina)
                 blocks = parse_structure(doc.raw_text)
                 chunks = chunk_document(doc.raw_text, blocks, target_tokens=target_tokens)
 
@@ -131,7 +151,10 @@ def ingest_paths(
                     transient=transient,
                     # Lo scheletro viaggia col documento: senza, alla riconsegna non si saprebbe
                     # più dove stavano titoli, stacchi di pagina e corsivi.
-                    meta={"layout": doc.layout.to_dict()} if doc.layout else {},
+                    meta={
+                        **({"layout": doc.layout.to_dict()} if doc.layout else {}),
+                        **({"avvisi": list(doc.avvisi)} if doc.avvisi else {}),
+                    },
                 )
                 ses.add(row)
                 ses.commit()
@@ -162,6 +185,7 @@ def ingest_paths(
 
                 existing.add(digest)
                 report.imported.append(str(path))
+                report.warnings.extend((str(path), avviso) for avviso in doc.avvisi)
                 report.chunks += len(chunk_rows)
             except Exception as exc:  # noqa: BLE001 - registriamo e proseguiamo col file successivo
                 report.failed.append((str(path), str(exc)))

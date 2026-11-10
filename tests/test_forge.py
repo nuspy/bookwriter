@@ -7,6 +7,8 @@ zero, che un capitolo esiste solo se il file esiste.
 
 from __future__ import annotations
 
+import re
+
 import zipfile
 from pathlib import Path
 
@@ -86,6 +88,11 @@ class FintoModello:
             corpo = " ".join(f"Una frase di prosa che dice qualcosa di preciso numero {i}." for i in range(108))
             return (f"# Capitolo {numero}: Titolo del capitolo\n\n## Apertura\n\n{corpo}\n\n"
                     "## Note bibliografiche\n\nRossi, M. (2024). *Un'opera*. Editore.")
+        if "UNA SCENA" in sistema:
+            # una scena: prosa senza intestazione di capitolo (la stesura la mette da sé)
+            corpo = " ".join(f"Una frase di scena che dice qualcosa di preciso numero {i}."
+                             for i in range(108))
+            return f"## Una scena\n\n{corpo}"
         if "sezione di un libro" in sistema:
             return "# Introduzione\n\n" + " ".join(["Testo introduttivo."] * 40)
         return "Una risposta."
@@ -116,6 +123,13 @@ class FintoModello:
                 "front_matter": ["introduzione"], "back_matter": ["bibliografia"],
                 "rationale": "Tre passaggi, tre capitoli.",
             }
+        if "dramatic_question" in props:
+            # come un planner vero, assegna alla prima scena il materiale che gli è stato dato
+            piano = piano_finto()
+            ids = re.findall(r"\[(K[0-9a-f]{10})\]", messages[-1]["content"])
+            piano["scenes"][0]["claim_uses"] = [
+                {"claim_id": k, "function": "enigma", "how": "la lettera bagnata"} for k in ids[:2]]
+            return piano
         if "works" in props:
             return {"works": [{"title": "Un libro che c'è", "author": "Bianchi", "year": "2023",
                                "url": "", "draw_from": "La scena del molo, la bora che spegne le "
@@ -127,6 +141,34 @@ class FintoModello:
 
     def embed(self, texts, *, kind="document", model=None):
         return [[0.0] * 8 for _ in texts]
+
+
+def piano_finto(scene: int = 3) -> dict:
+    """Un piano delle scene senza blocker: ancore in ordine, stesso luogo, cambiamenti diversi.
+    Il piano di riserva (dai punti) è un blocker, e la stesura non parte senza deroga."""
+    variabili = ["conoscenza", "rischio", "possesso", "rapporto", "destinazione", "fuga"]
+    cose = ["la lettera", "il nome del pescatore", "la chiave del magazzino", "la barca",
+            "la foto", "il registro"]
+    return {
+        "goal": "capire chi ha lasciato il corpo al molo", "dramatic_question": "chi?",
+        "turn": "la lettera", "start": "al molo", "end": "al magazzino",
+        "bridge": {"from": "", "clue": "", "decision": "", "movement": "", "new_goal": ""},
+        "threads": [], "objects": [], "motif_chain": [], "already_known": [], "motifs": [],
+        "canon": [], "continuity_risks": [],
+        "scenes": [{
+            "id": str(k), "kind": "presente", "pov": "Elena", "place": "Trieste, Molo Audace",
+            "day": "lunedì", "time": f"{8 + k}:00 a.m.", "arrival": "",
+            "characters": "Elena Sartori", "goal": f"trovare {cose[k - 1]}",
+            "obstacle": "il vento", "stakes": "la verità", "clue": f"{cose[k - 1]} bagnata",
+            "belief_before": "un incidente", "belief_after": "un delitto",
+            "decision": f"Elena prende {cose[k - 1]}", "consequence": "la seguono",
+            "danger": "cresce", "bridge": "", "next_question": "chi la segue?",
+            "changes": [{"variable": variabili[k - 1], "before": "niente",
+                         "after": f"ha {cose[k - 1]}"}],
+            "reasoning": {"observed": "l'acqua", "interpretation": "è recente",
+                          "alternative": "la marea", "why": "basta guardare"},
+            "claim_uses": [], "words": 300} for k in range(1, scene + 1)],
+    }
 
 
 def _quaderno_pieno(state: ForgeState) -> None:

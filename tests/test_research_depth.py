@@ -46,7 +46,7 @@ class FintoRicerca(FintoModello):
             if kw.get("on_delta"):
                 kw["on_delta"]("content", risposta)
             return risposta
-        if "capitolo di libro" in sistema:
+        if "capitolo di libro" in sistema or "UNA SCENA" in sistema:
             self.scritti.append(messages[-1]["content"])
         return super().chat(messages, **kw)
 
@@ -315,7 +315,7 @@ def test_an_attached_document_is_read_and_can_resolve(
 
 def test_an_unsupported_attachment_is_said(tmp_path: Path, web) -> None:
     f = _con_questioni_aperte(tmp_path, web)
-    strano = tmp_path / "foto.png"
+    strano = tmp_path / "vocale.mp3"
     strano.write_bytes(b"x")
     _, materiale = f.resolve_with_material("", [strano])
     assert any("non supportato" in n for n in materiale.notes)
@@ -516,3 +516,14 @@ def test_old_format_research_counts_as_not_done_for_the_new_features(tmp_path: P
     testo = pg.next_step(f, web_on=False)
     assert "La ricerca è nel formato precedente" in testo and "Riprendi la ricerca" in testo
     assert "Ricerca finita" not in testo
+
+
+def test_a_scanned_or_mailed_attachment_is_now_read(tmp_path: Path, web) -> None:
+    """Gli allegati della chat si leggono come l'importazione: una mail entra come materiale."""
+    f = _con_questioni_aperte(tmp_path, web)
+    posta = tmp_path / "lettera.eml"
+    posta.write_text("From: a@b.it\nSubject: La lettera\n\nIl documento è del 1312.\n",
+                     encoding="utf-8")
+    _, materiale = f.resolve_with_material("", [posta])
+    assert not any("non supportato" in n for n in materiale.notes)
+    assert any("1312" in p.text for p in materiale.pages)

@@ -20,7 +20,7 @@ from bookwriter.organize.common import (
     order_key,
     persist_outline,
 )
-from bookwriter.organize.thematic import chapter_title
+from bookwriter.organize.thematic import chapter_title, style_note
 
 
 class SupportsChatJson(Protocol):
@@ -127,6 +127,8 @@ def organize_narrative(
     name: str = "Outline narrativo",
     chapters: int | None = None,
     model: str | None = None,
+    style_contract: str = "",
+    style_profile_id: int | None = None,
 ) -> OrganizeReport:
     nodes = load_nodes(db_path)
     if not nodes:
@@ -147,7 +149,7 @@ def organize_narrative(
         [
             {
                 "role": "system",
-                "content": (
+                "content": style_note(style_contract, "i titoli") + (
                     "Ordina i seguenti gruppi tematici in un ARCO NARRATIVO (impostazione → sviluppo "
                     "→ culmine → risoluzione). Per ciascuno indica 'group' (l'indice) e un 'title' evocativo."
                 ),
@@ -170,7 +172,7 @@ def organize_narrative(
         if idx not in used:
             members = sorted(c, key=lambda n: order_key(n, chunk_pos))
             groups.append((chapter_title(members, None, None), members))
-    return persist_outline(db_path, name, "narrative", groups)
+    return persist_outline(db_path, name, "narrative", groups, style_profile_id=style_profile_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -183,6 +185,8 @@ def organize_custom(
     *,
     name: str = "Outline personalizzato",
     model: str | None = None,
+    style_contract: str = "",
+    style_profile_id: int | None = None,
 ) -> OrganizeReport:
     nodes = load_nodes(db_path)
     if not nodes:
@@ -195,7 +199,7 @@ def organize_custom(
         [
             {
                 "role": "system",
-                "content": (
+                "content": style_note(style_contract, "i titoli dei capitoli") + (
                     f"Raggruppa e ordina i nodi in capitoli secondo questo criterio: «{criterion}». "
                     f"Ogni nodo in UN solo capitolo, usando gli 'id' forniti; dai a ogni capitolo un 'title'. "
                     f"L'ordine dei node_ids nel capitolo definisce la sequenza."
@@ -219,4 +223,4 @@ def organize_custom(
     if leftover:
         leftover.sort(key=lambda n: order_key(n, chunk_pos))
         groups.append(("Altro", leftover))
-    return persist_outline(db_path, name, "custom", groups)
+    return persist_outline(db_path, name, "custom", groups, style_profile_id=style_profile_id)

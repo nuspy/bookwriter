@@ -31,6 +31,8 @@ def subdivide_sections(
     model: str | None = None,
     max_per_chapter: int | None = 4,
     min_nodes: int = 3,
+    language: str = "",
+    style_contract: str = "",
     progress=None,
 ) -> dict:
     engine = make_engine(db_path)
@@ -73,7 +75,7 @@ def subdivide_sections(
         with Session(engine) as ses:
             for pos, group in enumerate(groups):
                 nodes = [n for n in (ses.get(Node, nid) for nid in group) if n is not None]
-                section = OutlineSection(chapter_id=ch_id, position=pos, title=chapter_title(nodes, client, model))
+                section = OutlineSection(chapter_id=ch_id, position=pos, title=chapter_title(nodes, client, model, language, style_contract))
                 ses.add(section)
                 ses.commit()
                 ses.refresh(section)

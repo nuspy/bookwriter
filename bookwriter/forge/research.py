@@ -460,13 +460,34 @@ def _hits(risultati: list[SearchResult]) -> list[store.Hit]:
 
 def _read(pagine: list[Page], origin: str = "web") -> list[store.PageRead]:
     return [store.PageRead(p.url, p.title, p.text[:store.PAGE_KEEP], origin, p.status, p.note,
-                           p.cleaning_line()) for p in pagine]
+                           p.cleaning_line(), author=p.author, published=p.published)
+            for p in pagine]
+
+
+#: Lo stato di una pagina che copia un'altra già letta: registrata, non riletta dal modello.
+DUPLICATE = "duplicato"
 
 
 def _page_objects(pagine: list[store.PageRead]) -> list[Page]:
     return [Page(url=p.url, title=p.title, text=p.text,
-                 readable=p.status != "non_leggibile", relevant=p.status != "non_pertinente",
-                 note=p.note, cleaning=p.cleaning) for p in pagine]
+                 readable=p.status != "non_leggibile",
+                 relevant=p.status not in ("non_pertinente", DUPLICATE),
+                 note=p.note, cleaning=p.cleaning, author=p.author, published=p.published)
+            for p in pagine]
+
+
+def same_question(testo: str, decise: list[store.Question], soglia: float = 0.6
+                  ) -> store.Question | None:
+    """La questione già decisa (in un altro capitolo) che dice la stessa cosa, se c'è: la
+    decisione dell'autore vale anche qui, e non gliela si richiede senza un motivo nuovo."""
+    from bookwriter.forge.claims import _unit, _vettore
+    from bookwriter.forge.metrics import _cos
+
+    if not decise:
+        return None
+    v = _unit(_vettore(testo))
+    migliore = max(decise, key=lambda q: _cos(v, _unit(_vettore(q.text))))
+    return migliore if _cos(v, _unit(_vettore(migliore.text))) >= soglia else None
 
 
 def usable(pagine: list[Page]) -> list[Page]:
@@ -593,15 +614,53 @@ def _add_unique(destinazione: list[store.Hit], nuovi: list[store.Hit]) -> list[s
     return aggiunti
 
 
-def _findings(dati: dict[str, Any]) -> list[store.Finding]:
+def _findings(dati: dict[str, Any], pages: list[Page] | None = None) -> list[store.Finding]:
+    """Le affermazioni ricavate dal modello. Con ``pages`` (le pagine che ha letto) ogni fonte si
+    controlla: un indirizzo che fra quelle pagine non c'è l'ha scritto il modello, e un indirizzo
+    inventato non va in nessuna bibliografia. L'affermazione resta, la fonte si segna non
+    verificata."""
+    lette = {norm_url(p.url): p for p in (pages or [])}
+    per_titolo = {_norm(p.title): p for p in (pages or []) if p.title}
     trovate = []
     for f in dati.get("findings") or []:
         if isinstance(f, dict):
-            trovate.append(store.Finding(
+            voce = store.Finding(
                 claim=str(f.get("claim") or ""), detail=str(f.get("detail") or ""),
                 level=str(f.get("level") or ""), source=str(f.get("source") or ""),
-                url=str(f.get("url") or ""), use=str(f.get("use") or "")))
+                url=str(f.get("url") or ""), use=str(f.get("use") or ""))
+            if pages is not None and voce.url and norm_url(voce.url) not in lette:
+                pagina = per_titolo.get(_norm(voce.source))
+                if pagina is not None:  # la fonte è giusta, l'indirizzo no: si corregge
+                    voce.url = pagina.url
+                else:
+                    voce.url, voce.unverified = "", True
+            trovate.append(voce)
     return trovate
+
+
+#: Le «questioni» che obiettano soltanto che una tesi dell'autore non è attestata. Non sono
+#: contrasti con un fatto: la ricerca sostiene il libro, non lo verifica, e l'autore non deve
+#: vederle (vedi la regola dei prompt di :func:`_sources_from_model`).
+_NOT_ATTESTED = re.compile(
+    r"non (?:è|e'|sono|risulta|risultano) (?:attestat|documentat|provat|verificabil|supportat)|"
+    r"non (?:va|vanno) present|nessuna (?:prova|evidenza)|leggenda tarda|"
+    r"not (?:attested|documented|supported|verifiable)|no (?:archaeological )?evidence",
+    re.IGNORECASE)
+
+
+def contrast_category(testo: str) -> str:
+    """Che tipo di contrasto è, a grandi linee: un'etichetta per chi decide."""
+    t = testo.lower()
+    if re.search(r"\b1[0-9]{3}\b|\b20[0-9]{2}\b|\bdata\b|\bdate\b|\banno\b|\byear|secolo|"
+                 r"century|cronolog", t):
+        return "cronologia"
+    if re.search(r"termin|nome |chiamat|spelling|grafia", t):
+        return "terminologia"
+    if re.search(r"fonti (?:non )?concord|discord|versioni divers|disagree", t):
+        return "incertezza"
+    if re.search(r"forum|blog|post |non affidabil|unreliable", t):
+        return "fonte_debole"
+    return "storica"
 
 
 def invented_terms(state: ForgeState) -> set[str]:
@@ -647,10 +706,16 @@ def _add_questions(data: store.ChapterData, punto: store.PointData,
             continue
         if termini and _is_invention(testo, termini):
             continue
+        if _NOT_ATTESTED.search(testo):
+            # «la tesi non è attestata» non è un contrasto con un fatto: non si pone
+            nota = "Contrasti non posti: obiettavano solo che una tesi del libro non è attestata."
+            if nota not in data.warnings:
+                data.warnings.append(nota)
+            continue
         esistenti.add(_norm(testo))
         ident = f"c{data.number}p{punto.index}q{len(data.questions) + 1}"
         domanda = store.Question(id=ident, text=testo, chapter=data.number, point=punto.index,
-                                 kind="contrasto")
+                                 kind="contrasto", category=contrast_category(testo))
         data.questions.append(domanda)
         nuove.append(domanda)
     return nuove
@@ -790,6 +855,13 @@ def chapter_research(
         data.does = str(chapter.get("does") or data.does)
     decise = {_norm(q.text): q for q in (vecchio.questions if vecchio else [])
               if q.status == store.DECISA}
+    # le decisioni prese negli altri capitoli: lo stesso contrasto non si richiede all'autore
+    altrove = [q for q in store.all_questions(project.research_dir, state.outline)
+               if q.status == store.DECISA and q.chapter != numero]
+    #: le pagine già lette in tutto il libro: una copia non si rilegge
+    from bookwriter.forge.claims import PageIndex
+    gia_lette = PageIndex.from_chapters(store.load_all_chapters(project.research_dir,
+                                                                 state.outline))
     data.stage = store.STAGE_POINTS
     sessione = jevmod.session(settings)  # None se Jev è spento o manca la chiave
     #: il testo intero delle pagine appena lette: su disco se ne tengono solo i primi
@@ -826,6 +898,12 @@ def chapter_research(
                              jev=sessione)
                 _add_unique(punto.results, _hits(risultati))
                 nuove = [p for p in _read(pagine) if norm_url(p.url) not in punto.read_urls()]
+                for p in nuove:
+                    if p.status == "" and p.text:
+                        if copia := gia_lette.duplicate_of(p.url, p.text):
+                            p.status, p.note = DUPLICATE, f"copia di {copia}"
+                        else:
+                            gia_lette.add(p.url, p.text)
                 punto.pages.extend(nuove)
                 interi.update({norm_url(p.url): p.text for p in pagine})
                 from bookwriter.forge import blocked
@@ -887,11 +965,15 @@ def chapter_research(
         data.warnings[:] = [w for w in data.warnings if not w.startswith(prefisso)]
         data.warnings.extend(w for w in pr.warnings if w not in data.warnings)
         visti = {_norm(f.claim) for f in punto.findings}
-        punto.findings.extend(f for f in _findings(dati) if _norm(f.claim) not in visti)
+        punto.findings.extend(f for f in _findings(dati, pr.pages)
+                              if _norm(f.claim) not in visti)
         for domanda in _add_questions(data, punto, list(dati.get("open_questions") or []),
                                       termini):
             if (anterior := decise.get(_norm(domanda.text))) is not None:
                 domanda.status, domanda.outcome = anterior.status, dict(anterior.outcome)
+            elif (gemella := same_question(domanda.text, altrove)) is not None:
+                domanda.status = gemella.status
+                domanda.outcome = {**gemella.outcome, "from": gemella.id}
         punto.done = True
         _flush_jev(data, sessione)
         store.save_chapter(project.research_dir, data)  # un punto alla volta: nulla va perso
@@ -1127,7 +1209,8 @@ def resolve_with_material(state: ForgeState, client: SupportsChat,
             errors.append(f"leggere il materiale: {exc}")
         return {}
     validi = {q.id for q in questions}
-    indirizzi = {p.url for p in pages}
+    letti = {norm_url(p.url): p.url for p in pages[:6]}
+    per_titolo = {_norm(p.title): p.url for p in pages[:6] if p.title}
     risolte: dict[str, store.Finding] = {}
     for voce in (risposta.get("resolutions") or []) if isinstance(risposta, dict) else []:
         if not isinstance(voce, dict) or voce.get("resolved") is not True:
@@ -1136,9 +1219,17 @@ def resolve_with_material(state: ForgeState, client: SupportsChat,
         fonte = str(voce.get("source") or "").strip()
         if ident not in validi or not fonte:
             continue  # niente fonte, niente risoluzione
-        url = str(voce.get("url") or "").strip()
-        if not url or (url not in indirizzi and not url.startswith("http")):
-            url = pages[0].url
+        # La fonte dev'essere una delle pagine lette: un indirizzo che il modello scrive da sé
+        # (era successo: «history.com/topics/knights-templar-al-aqsa-1120», mai scaricato) non
+        # risolve niente, perché nessuno l'ha letto.
+        detto = str(voce.get("url") or "").strip()
+        url = letti.get(norm_url(detto)) or per_titolo.get(_norm(fonte)) or ""
+        if not url and detto:
+            continue
+        if not url:
+            # nessun indirizzo: la pagina letta che nomina la fonte, o la prima del materiale
+            url = next((p.url for p in pages[:6] if fonte[:30].lower() in p.text.lower()),
+                       pages[0].url)
         risolte[ident] = store.Finding(
             claim=str(voce.get("claim") or "").strip(), detail=str(voce.get("detail") or ""),
             level=str(voce.get("level") or ""), source=fonte, url=url)
@@ -1352,7 +1443,7 @@ def _sources_for_new_pages(state, client, settings, data, chapter, punto, pagine
         _flush_jev(data, sessione)
     data.warnings.extend(w for w in pr.warnings if w not in data.warnings)
     esistenti = {_norm(f.claim) for f in punto.findings}
-    for f in _findings(dati):
+    for f in _findings(dati, pr.pages):
         if _norm(f.claim) not in esistenti:
             punto.findings.append(f)
     for domanda in _add_questions(data, punto, list(dati.get("open_questions") or []),

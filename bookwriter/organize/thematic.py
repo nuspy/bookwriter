@@ -2,6 +2,10 @@
 
 Clustering per embedding (KMeans, §clustering) o community detection sul grafo. I titoli derivano
 dai temi dominanti, opzionalmente rifiniti dall'LLM. L'ordine interno rispetta la posizione originale.
+
+Se l'autore ha scelto uno stile, i titoli lo seguono già qui (``style_contract``): sono la prima
+cosa del libro che il lettore vede, e un titolo scritto in un altro registro stonerebbe con la
+prosa che verrà dopo.
 """
 
 from __future__ import annotations
@@ -80,8 +84,20 @@ def _clean_title(raw: str, base: str) -> str:
     return candidates[-1][:80] if candidates else base
 
 
+def style_note(style_contract: str, what: str) -> str:
+    """Istruzione che applica il contratto di stile a un testo breve (titoli, motivazioni…)."""
+    contract = (style_contract or "").strip()
+    if not contract:
+        return ""
+    return (
+        f"Scrivi {what} rispettando questo stile, per quanto un testo così breve lo consente "
+        f"(registro, lessico, tono):\n{contract}\n"
+    )
+
+
 def chapter_title(
-    nodes: list[Node], client: SupportsChat | None, model: str | None, language: str = ""
+    nodes: list[Node], client: SupportsChat | None, model: str | None, language: str = "",
+    style_contract: str = "",
 ) -> str:
     """Titolo del capitolo: dal modello se disponibile, altrimenti i due temi dominanti."""
     themes = Counter(t for n in nodes for t in (n.themes or []))
@@ -97,7 +113,7 @@ def chapter_title(
             [
                 {
                     "role": "system",
-                    "content": (
+                    "content": style_note(style_contract, "il titolo") + (
                         f"Genera un titolo di capitolo breve (max 6 parole) in {lingua}, senza "
                         "virgolette e senza spiegazioni: rispondi solo con il titolo."
                     ),
@@ -115,7 +131,7 @@ def chapter_title(
 
 def retitle_outline(
     db_path: Path, outline_id: int, client: SupportsChat, *, model: str | None = None,
-    language: str = "", progress=None,
+    language: str = "", style_contract: str = "", progress=None,
 ) -> int:
     """Rigenera i titoli dei capitoli di una struttura esistente, senza toccarne il contenuto."""
     engine = make_engine(db_path)
@@ -140,7 +156,7 @@ def retitle_outline(
 
     for done, (chapter_id, nodes) in enumerate(materiale, start=1):
         if nodes:
-            titolo = chapter_title(nodes, client, model, language)
+            titolo = chapter_title(nodes, client, model, language, style_contract)
             # Una transazione breve per capitolo: il titolo è salvato appena pronto.
             with Session(engine) as ses:
                 chapter = ses.get(OutlineChapter, chapter_id)
@@ -163,6 +179,8 @@ def organize_thematic(
     client: SupportsChat | None = None,
     model: str | None = None,
     language: str = "",
+    style_contract: str = "",
+    style_profile_id: int | None = None,
     progress=None,
 ) -> OrganizeReport:
     nodes = load_nodes(db_path)
@@ -184,9 +202,9 @@ def organize_thematic(
         members = [node_by_id[i] for i in group if i in node_by_id]
         members.sort(key=lambda n: order_key(n, chunk_pos))
         if members:
-            groups.append((chapter_title(members, client, model, language), members))
+            groups.append((chapter_title(members, client, model, language, style_contract), members))
         if progress:
             progress(done, len(id_groups))
     # Capitoli ordinati per salienza totale decrescente.
     groups.sort(key=lambda g: sum(n.salience for n in g[1]), reverse=True)
-    return persist_outline(db_path, name, "thematic", groups)
+    return persist_outline(db_path, name, "thematic", groups, style_profile_id=style_profile_id)
